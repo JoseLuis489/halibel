@@ -12,6 +12,13 @@ let backendProcess: ChildProcess | null = null
 
 const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL']
 
+/**
+ * Inicia el proceso en segundo plano de Python (FastAPI) cuando la app está empaquetada.
+ * - Qué es: Gestor del proceso hijo (Sidecar supervisor).
+ * - Para qué se usa: Permitir que el instalador de Windows ejecute Halibel de forma autónoma sin que el usuario
+ *   tenga que instalar Python manualmente.
+ * - Qué conecta: Ejecuta el binario compilado `resources/bin/halibel-backend.exe` y supervisa su ciclo de vida.
+ */
 function startBackendSidecar() {
   if (app.isPackaged) {
     const isWin = process.platform === 'win32'
@@ -37,6 +44,14 @@ function startBackendSidecar() {
   }
 }
 
+/**
+ * Crea y configura la ventana principal transparente y siempre visible de Halibel.
+ * - Qué es: Instanciación de `BrowserWindow` con Chromium embebido.
+ * - Para qué se usa: Crear la capa visual flotante (`transparent: true`, `frame: false`, `alwaysOnTop: true`)
+ *   posicionada en la esquina inferior derecha de la pantalla del usuario.
+ * - Qué conecta: Carga el frontend de React (vía URL de Vite en desarrollo o `dist/index.html` en producción)
+ *   e inyecta el script seguro `preload.ts`.
+ */
 function createWindow() {
   const primaryDisplay = screen.getPrimaryDisplay()
   const { width, height } = primaryDisplay.workAreaSize
@@ -59,7 +74,7 @@ function createWindow() {
     },
   })
 
-  // Permite arrastrar la ventana manteniendo el fondo transparente
+  // Mantiene la ventana por encima de otras aplicaciones
   win.setAlwaysOnTop(true, 'screen-saver')
 
   win.webContents.on('did-finish-load', () => {
@@ -73,20 +88,30 @@ function createWindow() {
   }
 }
 
-// Handlers de IPC
+// --------------------------------------------------------------------------
+// Canales de Comunicación Inter-Procesos (IPC Handlers)
+// --------------------------------------------------------------------------
+
+// Minimiza la ventana desde el botón de la cabecera en React
 ipcMain.handle('window:minimize', () => {
   win?.minimize()
 })
 
+// Cierra completamente la aplicación desde la interfaz
 ipcMain.handle('window:close', () => {
   app.quit()
 })
 
+// Redimensiona dinámicamente la ventana cuando la esfera se expande o colapsa
 ipcMain.handle('window:resize', (_event, width: number, height: number) => {
   if (win) {
     win.setSize(width, height)
   }
 })
+
+// --------------------------------------------------------------------------
+// Ciclo de Vida de Electron
+// --------------------------------------------------------------------------
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
@@ -94,6 +119,7 @@ app.on('window-all-closed', () => {
   }
 })
 
+// Garantiza que el backend de Python se cierre limpiamente al salir
 app.on('before-quit', () => {
   if (backendProcess && !backendProcess.killed) {
     console.log('Cerrando backend sidecar...')
