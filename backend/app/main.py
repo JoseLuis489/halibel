@@ -11,7 +11,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.v1.endpoints import chat, health
+from app.api.v1.endpoints import chat, health, usage
 from app.core.config import settings
 
 app = FastAPI(
@@ -32,9 +32,27 @@ app.add_middleware(
 # Register routers
 app.include_router(health.router, prefix="/api/v1", tags=["Health"])
 app.include_router(chat.router, prefix="/api/v1", tags=["Chat"])
+app.include_router(usage.router, tags=["Usage Monitor"])
+
+@app.get("/usage", include_in_schema=False)
+async def redirect_to_usage():
+    """
+    Atajo amigable para acceder al monitor de uso.
+    - Qué es: Redirección HTTP 307 (/usage -> /admin/usage).
+    - Para qué se usa: Facilitar la apertura del dashboard desde el navegador sin escribir la ruta completa.
+    - Qué conecta: Redirige al endpoint `usage_dashboard`.
+    """
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/admin/usage")
 
 @app.get("/")
 async def root():
+    """
+    Punto de entrada base del servidor FastAPI.
+    - Qué es: Endpoint raíz informativa (GET /).
+    - Para qué se usa: Confirmar que el backend está encendido y ofrecer enlaces rápidos a Swagger y Health.
+    - Qué conecta: Muestra el estado del servicio y enlaces a `/docs` y `/api/v1/health`.
+    """
     return {
         "message": "Halibel Engine is running.",
         "docs": "/docs",
