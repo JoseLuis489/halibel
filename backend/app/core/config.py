@@ -1,4 +1,5 @@
 from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Directorio raíz del backend (resuelve rutas de forma segura en Windows y Linux)
