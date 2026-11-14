@@ -1,10 +1,20 @@
 import React, { useState, useEffect, useRef } from 'react'
-import { Send, X, Minus, Sparkles, Square, WifiOff } from 'lucide-react'
+import { Send, X, Minus, Sparkles, Square, WifiOff, AlertTriangle, Check } from 'lucide-react'
+
+// Estructura de solicitud de autorización de herramientas (Human-in-the-Loop)
+interface ToolApprovalRequest {
+  id: string
+  tool: string
+  args: Record<string, unknown>
+  description: string
+  status: 'pending' | 'approved' | 'rejected'
+}
 
 // Estructura de cada mensaje en el historial del chat
 interface Message {
   role: 'user' | 'halibel'
   content: string
+  approval?: ToolApprovalRequest
 }
 
 // Estados visuales y anímicos de la esfera compañera
@@ -209,6 +219,23 @@ export default function App() {
                 { ...last, content: last.content + data.content },
               ]
             })
+          } else if (data.type === 'tool_approval_request') {
+            // Solicitud interactiva de confirmación humana antes de ejecutar una acción destructiva
+            setState('thinking')
+            setMessages((prev) => [
+              ...prev,
+              {
+                role: 'halibel',
+                content: '',
+                approval: {
+                  id: data.tool_call_id,
+                  tool: data.tool,
+                  args: (data.args as Record<string, unknown>) || {},
+                  description: data.description,
+                  status: 'pending',
+                },
+              },
+            ])
           } else if (data.type === 'stream_end') {
             setState('idle')
           } else if (data.type === 'error') {
@@ -269,6 +296,36 @@ export default function App() {
       socketRef.current.send(JSON.stringify({ type: 'cancel' }))
     }
     setState('idle')
+  }
+
+  /**
+   * Responde a una solicitud de autorización de herramienta interactiva (Human-in-the-Loop)
+   * enviando la decisión del usuario al backend a través del WebSocket.
+   */
+  const handleApproval = (id: string, approved: boolean) => {
+    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+      socketRef.current.send(
+        JSON.stringify({
+          type: 'tool_approval_response',
+          tool_call_id: id,
+          approved,
+        })
+      )
+    }
+    // Actualizar visualmente la tarjeta para reflejar la decisión tomada
+    setMessages((prev) =>
+      prev.map((msg) =>
+        msg.approval && msg.approval.id === id
+          ? {
+              ...msg,
+              approval: {
+                ...msg.approval,
+                status: approved ? 'approved' : 'rejected',
+              },
+            }
+          : msg
+      )
+    )
   }
 
   /**
@@ -364,11 +421,45 @@ export default function App() {
             </div>
           </div>
 
-          {/* Área de historial de mensajes con formato Markdown y scroll automático */}
+          {/* Área de historial de mensajes con formato Markdown, tarjetas interactivas y scroll automático */}
           <div className="chat-messages">
             {messages.map((msg, index) => (
               <div key={index} className={`message-bubble ${msg.role}`}>
-                <FormattedMessage content={msg.content} />
+                {msg.approval && (
+                  <div className="approval-card">
+                    <div className="approval-header">
+                      <AlertTriangle size={15} color="#eab308" />
+                      <span>Autorización requerida</span>
+                    </div>
+                    <p className="approval-desc">{msg.approval.description}</p>
+                    {Boolean(msg.approval.args?.path) && (
+                      <div className="approval-path">
+                        <code>{String(msg.approval.args.path)}</code>
+                      </div>
+                    )}
+                    {msg.approval.status === 'pending' ? (
+                      <div className="approval-actions">
+                        <button
+                          className="btn-approve"
+                          onClick={() => handleApproval(msg.approval!.id, true)}
+                        >
+                          <Check size={13} /> Autorizar
+                        </button>
+                        <button
+                          className="btn-reject"
+                          onClick={() => handleApproval(msg.approval!.id, false)}
+                        >
+                          <X size={13} /> Rechazar
+                        </button>
+                      </div>
+                    ) : (
+                      <div className={`approval-status ${msg.approval.status}`}>
+                        {msg.approval.status === 'approved' ? '✓ Autorizado' : '✕ Cancelado'}
+                      </div>
+                    )}
+                  </div>
+                )}
+                {msg.content && <FormattedMessage content={msg.content} />}
               </div>
             ))}
             <div ref={messagesEndRef} />
