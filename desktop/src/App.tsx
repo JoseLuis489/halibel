@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react'
-import { Send, X, Minus, Sparkles, Square, WifiOff, AlertTriangle, Check } from 'lucide-react'
+import { Send, X, Minus, Sparkles, Square, WifiOff, AlertTriangle, Check, ArrowDown } from 'lucide-react'
 
 // Estructura de solicitud de autorización de herramientas (Human-in-the-Loop)
 interface ToolApprovalRequest {
@@ -127,7 +127,7 @@ function FormattedMessage({ content }: { content: string }) {
  * - Qué es: Componente funcional de React que gestiona el estado visual de la esfera y el panel de conversación.
  * - Para qué se usa:
  *     1. Mostrar la esfera interactiva con animaciones de respiración, pensamiento, habla o desconexión.
- *     2. Renderizar el panel de chat con soporte de formato Markdown y estado de conexión en vivo.
+ *     2. Renderizar el panel de chat con soporte de formato Markdown, tarjetas Human-in-the-Loop y scroll inteligente.
  *     3. Gestionar una única conexión WebSocket resiliente con backoff exponencial y cancelación.
  * - Qué conecta: Conecta la UI con Electron (`preload.ts`) y el endpoint `ws://127.0.0.1:8000/api/v1/ws/chat`.
  */
@@ -142,17 +142,59 @@ export default function App() {
   ])
   const [state, setState] = useState<CompanionState>('idle')
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('connecting')
+  const [showScrollBottom, setShowScrollBottom] = useState(false)
 
   const socketRef = useRef<WebSocket | null>(null)
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const reconnectAttemptsRef = useRef<number>(0)
-  const messagesEndRef = useRef<HTMLDivElement>(null)
+
+  // Referencias para el Auto-Scroll Inteligente
+  const chatContainerRef = useRef<HTMLDivElement>(null)
+  const isUserNearBottomRef = useRef<boolean>(true)
 
   /**
-   * Auto-desplazamiento suave al último mensaje recibido.
+   * Detecta si el usuario está cerca del fondo del contenedor o si subió manualmente a leer.
+   * - Umbral de 60px: si está a menos de 60px del borde inferior, se considera "anclado al final".
+   */
+  const handleChatScroll = () => {
+    const container = chatContainerRef.current
+    if (!container) return
+
+    const distanceFromBottom =
+      container.scrollHeight - container.scrollTop - container.clientHeight
+
+    const nearBottom = distanceFromBottom <= 60
+    isUserNearBottomRef.current = nearBottom
+    setShowScrollBottom(!nearBottom)
+  }
+
+  /**
+   * Desplaza el contenedor hasta el final de forma controlada (al enviar mensaje o pulsar el botón).
+   */
+  const scrollToBottom = (behavior: ScrollBehavior = 'smooth') => {
+    const container = chatContainerRef.current
+    if (!container) return
+
+    container.scrollTo({
+      top: container.scrollHeight,
+      behavior,
+    })
+    isUserNearBottomRef.current = true
+    setShowScrollBottom(false)
+  }
+
+  /**
+   * Auto-desplazamiento inteligente:
+   * - Solo acompaña el streaming si el usuario NO ha subido manualmente a leer arriba.
+   * - Usa 'auto' (instantáneo) durante el streaming para evitar el lag de animaciones encadenadas.
    */
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    if (isUserNearBottomRef.current) {
+      const container = chatContainerRef.current
+      if (container) {
+        container.scrollTop = container.scrollHeight
+      }
+    }
   }, [messages])
 
   /**
@@ -170,8 +212,6 @@ export default function App() {
 
   /**
    * Gestión estricta del ciclo de vida del WebSocket (anti-zombies y backoff exponencial).
-   * - Evita múltiples conexiones simultáneas en recargas rápidas (HMR).
-   * - Limpia tanto el socket como los temporizadores pendientes al desmontar.
    */
   useEffect(() => {
     let isMounted = true
@@ -179,7 +219,6 @@ export default function App() {
     const connectWS = () => {
       if (!isMounted) return
 
-      // Cerrar cualquier socket residual antes de abrir uno nuevo
       if (socketRef.current) {
         socketRef.current.onclose = null
         socketRef.current.close()
@@ -220,7 +259,8 @@ export default function App() {
               ]
             })
           } else if (data.type === 'tool_approval_request') {
-            // Solicitud interactiva de confirmación humana antes de ejecutar una acción destructiva
+            // Si llega una solicitud de confirmación crítica, bajamos el scroll para que el usuario la vea
+            isUserNearBottomRef.current = true
             setState('thinking')
             setMessages((prev) => [
               ...prev,
@@ -258,11 +298,9 @@ export default function App() {
         if (!isMounted) return
 
         setConnectionStatus('disconnected')
-        // Garantizar que la UI no quede bloqueada si el servidor cayó a mitad de una respuesta
         setState('idle')
         socketRef.current = null
 
-        // Backoff exponencial suave: 1.5s -> 3s -> 6s -> máx 10s
         const delay = Math.min(1500 * Math.pow(2, reconnectAttemptsRef.current), 10000)
         reconnectAttemptsRef.current += 1
 
@@ -273,7 +311,6 @@ export default function App() {
 
     connectWS()
 
-    // Limpieza estricta al desmontar o recargar por HMR
     return () => {
       isMounted = false
       if (reconnectTimeoutRef.current) {
@@ -281,7 +318,7 @@ export default function App() {
         reconnectTimeoutRef.current = null
       }
       if (socketRef.current) {
-        socketRef.current.onclose = null // Evita que el cierre manual dispare un reconect
+        socketRef.current.onclose = null
         socketRef.current.close()
         socketRef.current = null
       }
@@ -299,8 +336,7 @@ export default function App() {
   }
 
   /**
-   * Responde a una solicitud de autorización de herramienta interactiva (Human-in-the-Loop)
-   * enviando la decisión del usuario al backend a través del WebSocket.
+   * Responde a una solicitud de autorización de herramienta interactiva (Human-in-the-Loop).
    */
   const handleApproval = (id: string, approved: boolean) => {
     if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
@@ -312,7 +348,6 @@ export default function App() {
         })
       )
     }
-    // Actualizar visualmente la tarjeta para reflejar la decisión tomada
     setMessages((prev) =>
       prev.map((msg) =>
         msg.approval && msg.approval.id === id
@@ -335,20 +370,30 @@ export default function App() {
     if (!input.trim() || state !== 'idle') return
 
     const userText = input.trim()
+    // Al enviar un mensaje nuevo, reactivamos el anclaje al final del chat
+    isUserNearBottomRef.current = true
+    setShowScrollBottom(false)
+
     const newMessages = [...messages, { role: 'user' as const, content: userText }]
     setMessages(newMessages)
     setInput('')
     setState('thinking')
 
     if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+      // Filtramos mensajes vacíos (como tarjetas de aprobación sin texto) para no ensuciar el historial
+      const validHistory = messages
+        .filter((m) => m.content.trim().length > 0)
+        .slice(-8)
+        .map((m) => ({
+          role: m.role === 'user' ? 'user' : 'model',
+          content: m.content,
+        }))
+
       socketRef.current.send(
         JSON.stringify({
           type: 'chat',
           message: userText,
-          history: messages.slice(-8).map((m) => ({
-            role: m.role === 'user' ? 'user' : 'model',
-            content: m.content,
-          })),
+          history: validHistory,
         })
       )
     } else {
@@ -377,7 +422,7 @@ export default function App() {
   return (
     <div className="app-container">
       {isOpen && (
-        <div className="chat-panel">
+        <div className="chat-panel" style={{ position: 'relative' }}>
           {/* Cabecera arrastrable con indicador de estado de conexión */}
           <div className="panel-header">
             <div className="header-title">
@@ -421,8 +466,12 @@ export default function App() {
             </div>
           </div>
 
-          {/* Área de historial de mensajes con formato Markdown, tarjetas interactivas y scroll automático */}
-          <div className="chat-messages">
+          {/* Área de historial de mensajes con detección inteligente de scroll */}
+          <div
+            className="chat-messages"
+            ref={chatContainerRef}
+            onScroll={handleChatScroll}
+          >
             {messages.map((msg, index) => (
               <div key={index} className={`message-bubble ${msg.role}`}>
                 {msg.approval && (
@@ -462,8 +511,34 @@ export default function App() {
                 {msg.content && <FormattedMessage content={msg.content} />}
               </div>
             ))}
-            <div ref={messagesEndRef} />
           </div>
+
+          {/* Botón flotante para volver abajo cuando el usuario subió a leer */}
+          {showScrollBottom && (
+            <button
+              onClick={() => scrollToBottom('smooth')}
+              title="Ir al mensaje más reciente"
+              style={{
+                position: 'absolute',
+                right: '16px',
+                bottom: '64px',
+                width: '28px',
+                height: '28px',
+                borderRadius: '50%',
+                border: '1px solid rgba(255, 255, 255, 0.2)',
+                background: 'rgba(24, 24, 32, 0.9)',
+                color: '#fff',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                cursor: 'pointer',
+                boxShadow: '0 4px 12px rgba(0, 0, 0, 0.4)',
+                zIndex: 10,
+              }}
+            >
+              <ArrowDown size={14} />
+            </button>
+          )}
 
           {/* Campo de entrada de texto y botón de envío / cancelación */}
           <div className="chat-input-area">
