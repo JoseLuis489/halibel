@@ -108,13 +108,93 @@ async def websocket_chat(websocket: WebSocket):
     # Referencia a la tarea de streaming activa para poder cancelarla si el cliente se desconecta o aborta
     active_stream_task: asyncio.Task | None = None
 
+    # Diccionario de promesas asíncronas pendientes de aprobación humana (Human-in-the-Loop)
+    pending_approvals: dict[str, asyncio.Future[bool]] = {}
+
+    async def on_approval_request(call_id: str, tool_name: str, args: dict[str, Any], description: str) -> bool:
+        """
+        Solicita autorización interactiva al usuario a través del canal WebSocket.
+        - Qué es: Callback asíncrono para herramientas destructivas (Human-in-the-Loop).
+        - Para qué se usa: Enviar la solicitud de confirmación a la UI de Electron y suspender la ejecución
+          hasta que el usuario responda o se alcance el tiempo de espera preventivo (timeout).
+        - Qué conecta: Conecta el bucle de herramientas en `llm_service` con el frontend React.
+        """
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[bool] = loop.create_future()
+        pending_approvals[call_id] = future
+
+        sent = await _safe_send_json(
+            websocket,
+            {
+                "type": "tool_approval_request",
+                "tool_call_id": call_id,
+                "tool": tool_name,
+                "args": args,
+                "description": description,
+            },
+        )
+        if not sent:
+            pending_approvals.pop(call_id, None)
+            return False
+
+        try:
+            # Espera máxima de 120 segundos para que el usuario responda en la interfaz
+            return await asyncio.wait_for(future, timeout=120.0)
+        except TimeoutError:
+            logger.warning("Tiempo de espera agotado (120s) para la aprobación de herramienta: %s", call_id)
+            return False
+        finally:
+            pending_approvals.pop(call_id, None)
+
+    # Diccionario de promesas asíncronas pendientes de aprobación humana (Human-in-the-Loop)
+    pending_approvals: dict[str, asyncio.Future[bool]] = {}
+
+    async def on_approval_request(call_id: str, tool_name: str, args: dict[str, Any], description: str) -> bool:  # noqa: F811
+        """
+        Solicita autorización interactiva al usuario a través del canal WebSocket.
+        - Qué es: Callback asíncrono para herramientas destructivas (Human-in-the-Loop).
+        - Para qué se usa: Enviar la solicitud de confirmación a la UI de Electron y suspender la ejecución
+          hasta que el usuario responda o se alcance el tiempo de espera preventivo (timeout).
+        - Qué conecta: Conecta el bucle de herramientas en `llm_service` con el frontend React.
+        """
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[bool] = loop.create_future()
+        pending_approvals[call_id] = future
+
+        sent = await _safe_send_json(
+            websocket,
+            {
+                "type": "tool_approval_request",
+                "tool_call_id": call_id,
+                "tool": tool_name,
+                "args": args,
+                "description": description,
+            },
+        )
+        if not sent:
+            pending_approvals.pop(call_id, None)
+            return False
+
+        try:
+            # Espera máxima de 120 segundos para que el usuario responda en la interfaz
+            return await asyncio.wait_for(future, timeout=120.0)
+        except TimeoutError:
+            logger.warning("Tiempo de espera agotado (120s) para la aprobación de herramienta: %s", call_id)
+            return False
+        finally:
+            pending_approvals.pop(call_id, None)
+
     async def run_llm_stream(user_msg: str, history_data: list[dict[str, str]]) -> None:
         """Corrutina aislada que consume el generador de Gemini y envía chunks al cliente."""
         if not await _safe_send_json(websocket, {"type": "stream_start"}):
             return
 
         try:
-            async for chunk in llm_service.stream_message(user_msg, history=history_data):
+            async for chunk in llm_service.stream_message(
+                user_msg,
+                history=history_data,
+                on_approval_request=on_approval_request,
+            ):
                 sent = await _safe_send_json(websocket, {"type": "chunk", "content": chunk})
                 if not sent:
                     # Si falló el envío porque el cliente cayó, cortamos el generador inmediatamente
@@ -150,7 +230,7 @@ async def websocket_chat(websocket: WebSocket):
                 )
                 continue
 
-            # 2. Enrutamiento por tipo de evento (listo para Fase 2)
+            # 2. Enrutamiento por tipo de evento
             if payload.type == "cancel":
                 if active_stream_task and not active_stream_task.done():
                     logger.info("Solicitud de cancelación recibida desde el cliente.")
@@ -158,12 +238,15 @@ async def websocket_chat(websocket: WebSocket):
                 continue
 
             if payload.type == "tool_approval_response":
-                # Placeholder estructurado para la Fase 2
                 logger.info(
                     "Respuesta de aprobación de herramienta recibida: id=%s, approved=%s",
                     payload.tool_call_id,
                     payload.approved,
                 )
+                if payload.tool_call_id and payload.tool_call_id in pending_approvals:
+                    fut = pending_approvals[payload.tool_call_id]
+                    if not fut.done():
+                        fut.set_result(bool(payload.approved))
                 continue
 
             if payload.type == "chat":
@@ -184,6 +267,12 @@ async def websocket_chat(websocket: WebSocket):
     except Exception:
         logger.exception("Error crítico en el bucle principal del WebSocket")
     finally:
+        # Cancelar cualquier autorización interactiva que haya quedado colgada
+        for fut in pending_approvals.values():
+            if not fut.done():
+                fut.cancel()
+        pending_approvals.clear()
+
         # GARANTÍA ANTI-FUGA DE TOKENS:
         # Al salir del bucle (por desconexión o error), cancelamos cualquier generación activa en segundo plano
         if active_stream_task and not active_stream_task.done():

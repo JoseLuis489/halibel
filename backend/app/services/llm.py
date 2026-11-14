@@ -1,7 +1,9 @@
 import asyncio
 import logging
-from collections.abc import AsyncGenerator
+import uuid
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from datetime import datetime
+from typing import Any
 
 from google import genai
 from google.genai import types
@@ -9,6 +11,7 @@ from google.genai.errors import APIError
 
 from app.core.config import settings
 from app.services.usage import usage_service
+from app.tools.registry import AVAILABLE_TOOLS, execute_tool, is_destructive_tool
 
 logger = logging.getLogger(__name__)
 
@@ -45,17 +48,23 @@ class LLMService:
         self,
         user_message: str,
         history: list[dict[str, str]] | None = None,
+        on_approval_request: Callable[[str, str, dict[str, Any], str], Awaitable[bool]] | None = None,
     ) -> AsyncGenerator[str, None]:
         """
-        Genera y transmite la respuesta de Halibel fragmento a fragmento (tokens) en tiempo real.
-        - Qué es: Generador asíncrono (AsyncGenerator) de streaming.
+        Genera y transmite la respuesta de Halibel fragmento a fragmento en tiempo real,
+        orquestando de forma autónoma la ejecución de herramientas seguras y la supervisión
+        humana (Human-in-the-Loop) para herramientas destructivas.
+        - Qué es: Bucle de razonamiento y ejecución de agente (Agent Loop) con streaming asíncrono.
         - Para qué se usa:
             1. Inyectar en el System Instruction la personalidad y la fecha/hora exacta del sistema operativo.
-            2. Construir la lista de contenidos con el historial multi-turno previo.
-            3. Llamar a `client.aio.models.generate_content_stream` de forma 100% asíncrona.
-            4. Emitir cada fragmento de texto (`chunk.text`) hacia la interfaz.
-            5. Capturar los metadatos de uso (`usage_metadata`) al terminar y guardarlos en SQLite.
-        - Qué conecta: Conecta la API de Gemini con el canal WebSocket de `chat.py` y con `usage_service.log_usage`.
+            2. Construir la lista de contenidos con el historial previo y las herramientas registradas.
+            3. Detectar llamadas a funciones (`function_calls`) emitidas por Gemini.
+            4. Ejecutar automáticamente herramientas de solo lectura (`list_directory`, `read_file`).
+            5. Pausar y solicitar confirmación interactiva para herramientas destructivas (`safe_delete_file`).
+            6. Reinyectar los resultados en el contexto y continuar el streaming de la respuesta final.
+            7. Acumular y registrar el consumo de tokens en SQLite al finalizar.
+        - Qué conecta: Conecta Gemini API con el catálogo de herramientas (`app.tools.registry`),
+          el WebSocket (`chat.py`) y el monitor de uso (`usage_service`).
         """
         if not settings.GEMINI_API_KEY:
             yield (
@@ -75,10 +84,12 @@ class LLMService:
         config = types.GenerateContentConfig(
             system_instruction=system_instruction,
             temperature=0.7,
+            tools=AVAILABLE_TOOLS,
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         )
 
         # Construcción de la conversación con el historial previo
-        contents: list[types.Content | str] = []
+        contents: list[types.Content] = []
         if history:
             for item in history:
                 role = "user" if item.get("role") == "user" else "model"
@@ -88,26 +99,101 @@ class LLMService:
                         parts=[types.Part.from_text(text=item.get("content", ""))],
                     )
                 )
-        contents.append(user_message)
+        contents.append(
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=user_message)],
+            )
+        )
 
-        final_usage = None
+        total_prompt_tokens = 0
+        total_candidate_tokens = 0
+        max_tool_iterations = 5
 
         try:
-            # Usamos .aio para que tanto la conexión como la lectura de cada chunk sean 100% no bloqueantes
-            stream_response = await self.client.aio.models.generate_content_stream(
-                model=settings.GEMINI_MODEL,
-                contents=contents,
-                config=config,
-            )
+            for _ in range(max_tool_iterations):
+                # Usamos .aio para streaming no bloqueante con Gemini
+                stream_response = await self.client.aio.models.generate_content_stream(
+                    model=settings.GEMINI_MODEL,
+                    contents=contents,
+                    config=config,
+                )
 
-            async for chunk in stream_response:
-                if chunk.usage_metadata:
-                    final_usage = chunk.usage_metadata
-                if chunk.text:
-                    yield chunk.text
+                function_calls: list[types.FunctionCall] = []
+                model_parts: list[types.Part] = []
+                turn_usage = None
+
+                async for chunk in stream_response:
+                    if chunk.usage_metadata:
+                        turn_usage = chunk.usage_metadata
+
+                    if chunk.function_calls:
+                        function_calls.extend(chunk.function_calls)
+
+                    if chunk.candidates and chunk.candidates[0].content and chunk.candidates[0].content.parts:
+                        model_parts.extend(chunk.candidates[0].content.parts)
+
+                    if chunk.text:
+                        yield chunk.text
+
+                # Acumular tokens consumidos en este turno
+                if turn_usage:
+                    total_prompt_tokens += (turn_usage.prompt_token_count or 0)
+                    total_candidate_tokens += (turn_usage.candidates_token_count or 0)
+
+                # Si no hubo llamadas a herramientas, la respuesta conversacional terminó
+                if not function_calls:
+                    break
+
+                # Registrar la llamada que hizo el modelo antes de inyectar las respuestas
+                contents.append(types.Content(role="model", parts=model_parts))
+                response_parts: list[types.Part] = []
+
+                for call in function_calls:
+                    call_id = call.id or f"call_{uuid.uuid4().hex[:8]}"
+                    call_name = call.name
+                    call_args = call.args or {}
+
+                    if is_destructive_tool(call_name):
+                        target_path = str(call_args.get("path", "archivo"))
+                        desc = f"Halibel solicita enviar el archivo '{target_path}' a la papelera de reciclaje."
+                        yield f"\n⚠️ *[Solicitando autorización para: {call_name}]*\n"
+
+                        approved = False
+                        if on_approval_request:
+                            try:
+                                approved = await on_approval_request(call_id, call_name, call_args, desc)
+                            except Exception as e:  # noqa: BLE001
+                                logger.error("Error esperando autorización del usuario: %s", e)
+                                approved = False
+                        else:
+                            logger.warning("Acción destructiva rechazada: no se proporcionó callback de aprobación.")
+
+                        if approved:
+                            yield f"\n*[Acción autorizada por el usuario. Ejecutando {call_name}...]*\n\n"
+                            result = execute_tool(call_name, call_args)
+                        else:
+                            yield "\n*[Acción cancelada o rechazada por el usuario.]*\n\n"
+                            result = {
+                                "status": "cancelled",
+                                "message": f"Operación cancelada: El usuario no autorizó eliminar el archivo '{target_path}'.",
+                            }
+                    else:
+                        # Herramienta de lectura segura
+                        yield f"\n🔍 *[Consultando: {call_name}...]*\n\n"
+                        result = execute_tool(call_name, call_args)
+
+                    response_parts.append(
+                        types.Part.from_function_response(
+                            name=call_name,
+                            response={"result": result},
+                        )
+                    )
+
+                contents.append(types.Content(role="user", parts=response_parts))
 
         except asyncio.CancelledError:
-            # Si el usuario cierra la pestaña o detiene el mensaje, registramos y propagamos la cancelación limpia
+            # Si el usuario cierra la ventana o detiene el mensaje, cancelamos limpiamente
             logger.info("Streaming cancelado por el cliente (WebSocket desconectado o abortado).")
             raise
 
@@ -133,14 +219,13 @@ class LLMService:
             yield "\n[Ocurrió un error interno inesperado al procesar tu mensaje.]"
             return  # Evitamos intentar registrar métricas si el flujo falló a mitad
 
-        # Aislamos el guardado en SQLite: si la BD falla o está bloqueada, el usuario NO ve un error en el chat
-        if final_usage:
-            try:
-                p_tokens = final_usage.prompt_token_count or 0
-                c_tokens = final_usage.candidates_token_count or 0
-                usage_service.log_usage(settings.GEMINI_MODEL, p_tokens, c_tokens)
-            except Exception:
-                logger.exception("No se pudieron registrar los tokens en SQLite, pero la respuesta se entregó.")
+        finally:
+            # Aislamos el guardado en SQLite: si la BD falla, el chat NO se rompe
+            if total_prompt_tokens > 0 or total_candidate_tokens > 0:
+                try:
+                    usage_service.log_usage(settings.GEMINI_MODEL, total_prompt_tokens, total_candidate_tokens)
+                except Exception:
+                    logger.exception("No se pudieron registrar los tokens en SQLite, pero la respuesta se entregó.")
 
 
 # Instancia compartida del servicio
