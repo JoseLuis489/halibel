@@ -1,8 +1,11 @@
 import asyncio
 import logging
+import os
+import platform
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from google import genai
@@ -16,11 +19,34 @@ from app.tools.registry import AVAILABLE_TOOLS, execute_tool, is_destructive_too
 logger = logging.getLogger(__name__)
 
 
+def _build_runtime_context() -> str:
+    """
+    Construye el bloque de contexto dinámico del entorno local del usuario.
+    - Qué es: Helper de introspección del sistema operativo y rutas base.
+    - Para qué se usa: Inyectar fecha/hora, SO real (Windows/Linux/Darwin), separador de rutas
+      y directorio de usuario para que Gemini genere rutas nativas válidas sin alucinar sintaxis.
+    """
+    now = datetime.now()
+    os_name = platform.system()       # Ej: 'Windows', 'Linux', 'Darwin'
+    os_release = platform.release() # Ej: '10', '11', '6.8.0-...'
+    home_dir = str(Path.home())
+    cwd_dir = str(Path.cwd())
+
+    return (
+        f"[Contexto del sistema del usuario]:\n"
+        f"- Fecha y hora actual del equipo: {now.strftime('%d-%m-%Y %H:%M:%S')}.\n"
+        f"- Sistema operativo: {os_name} {os_release} (separador de rutas: '{os.sep}').\n"
+        f"- Directorio raíz del usuario (Home): {home_dir}\n"
+        f"- Directorio actual de trabajo (CWD): {cwd_dir}\n"
+        f"- Regla de rutas: Usa siempre la sintaxis nativa de {os_name} al construir o mostrar rutas."
+    )
+
+
 class LLMService:
     """
     Servicio de integración con el modelo de lenguaje (Gemini API).
     - Qué es: Capa adaptadora entre el backend y el SDK oficial google-genai.
-    - Para qué se usa: Gestionar la autenticación, ensamblar el contexto (persona + fecha/hora + historial),
+    - Para qué se usa: Gestionar la autenticación, ensamblar el contexto (persona + entorno SO + historial),
       transmitir respuestas en streaming continuo y registrar el consumo de tokens.
     - Qué conecta: Se comunica externamente con la API de Google y sirve internamente a los endpoints
       de chat (chat.py) y al monitor de métricas (usage_service).
@@ -56,10 +82,10 @@ class LLMService:
         humana (Human-in-the-Loop) para herramientas destructivas.
         - Qué es: Bucle de razonamiento y ejecución de agente (Agent Loop) con streaming asíncrono.
         - Para qué se usa:
-            1. Inyectar en el System Instruction la personalidad y la fecha/hora exacta del sistema operativo.
+            1. Inyectar en el System Instruction la personalidad, fecha/hora y metadatos del SO real.
             2. Construir la lista de contenidos con el historial previo y las herramientas registradas.
             3. Detectar llamadas a funciones (`function_calls`) emitidas por Gemini.
-            4. Ejecutar automáticamente herramientas de solo lectura (`list_directory`, `read_file`).
+            4. Ejecutar herramientas de solo lectura en hilo separado (`asyncio.to_thread`).
             5. Pausar y solicitar confirmación interactiva para herramientas destructivas (`safe_delete_file`).
             6. Reinyectar los resultados en el contexto y continuar el streaming de la respuesta final.
             7. Acumular y registrar el consumo de tokens en SQLite al finalizar.
@@ -73,13 +99,8 @@ class LLMService:
             )
             return
 
-        # Contexto dinámico de fecha y hora local del sistema
-        now = datetime.now()
-        system_instruction = (
-            f"{settings.HALIBEL_PERSONA}\n\n"
-            f"[Contexto del sistema del usuario]:\n"
-            f"- Fecha y hora actual del equipo: {now.strftime('%d-%m-%Y %H:%M:%S')}."
-        )
+        # Contexto dinámico: personalidad + fecha/hora + arquitectura real del SO
+        system_instruction = f"{settings.HALIBEL_PERSONA}\n\n{_build_runtime_context()}"
 
         config = types.GenerateContentConfig(
             system_instruction=system_instruction,
@@ -109,6 +130,7 @@ class LLMService:
         total_prompt_tokens = 0
         total_candidate_tokens = 0
         max_tool_iterations = 5
+        completed_naturally = False
 
         try:
             for _ in range(max_tool_iterations):
@@ -143,6 +165,7 @@ class LLMService:
 
                 # Si no hubo llamadas a herramientas, la respuesta conversacional terminó
                 if not function_calls:
+                    completed_naturally = True
                     break
 
                 # Registrar la llamada que hizo el modelo antes de inyectar las respuestas
@@ -151,8 +174,8 @@ class LLMService:
 
                 for call in function_calls:
                     call_id = call.id or f"call_{uuid.uuid4().hex[:8]}"
-                    call_name = call.name
-                    call_args = call.args or {}
+                    call_name = call.name or "unknown_tool"
+                    call_args = dict(call.args) if call.args else {}
 
                     if is_destructive_tool(call_name):
                         target_path = str(call_args.get("path", "archivo"))
@@ -163,6 +186,9 @@ class LLMService:
                         if on_approval_request:
                             try:
                                 approved = await on_approval_request(call_id, call_name, call_args, desc)
+                            except TimeoutError:
+                                logger.warning("Tiempo de espera agotado (timeout) para aprobar %s", call_name)
+                                approved = False
                             except Exception as e:  # noqa: BLE001
                                 logger.error("Error esperando autorización del usuario: %s", e)
                                 approved = False
@@ -171,7 +197,8 @@ class LLMService:
 
                         if approved:
                             yield f"\n*[Acción autorizada por el usuario. Ejecutando {call_name}...]*\n\n"
-                            result = execute_tool(call_name, call_args)
+                            # Ejecutamos I/O de disco y papelera en un hilo secundario para no bloquear asyncio
+                            result = await asyncio.to_thread(execute_tool, call_name, call_args)
                         else:
                             yield "\n*[Acción cancelada o rechazada por el usuario.]*\n\n"
                             result = {
@@ -179,9 +206,9 @@ class LLMService:
                                 "message": f"Operación cancelada: El usuario no autorizó eliminar el archivo '{target_path}'.",
                             }
                     else:
-                        # Herramienta de lectura segura
+                        # Herramienta de lectura segura ejecutada sin bloquear el event loop
                         yield f"\n🔍 *[Consultando: {call_name}...]*\n\n"
-                        result = execute_tool(call_name, call_args)
+                        result = await asyncio.to_thread(execute_tool, call_name, call_args)
 
                     response_parts.append(
                         types.Part.from_function_response(
@@ -192,13 +219,16 @@ class LLMService:
 
                 contents.append(types.Content(role="user", parts=response_parts))
 
+            # Aviso explícito si el agente agotó los 5 pasos sin emitir respuesta final
+            if not completed_naturally:
+                logger.warning("El agente alcanzó el límite máximo de %d iteraciones de herramientas.", max_tool_iterations)
+                yield "\n\n*[Alcancé el límite máximo de pasos autónomos para esta solicitud. Pídeme continuar si necesitas más detalles.]*"
+
         except asyncio.CancelledError:
-            # Si el usuario cierra la ventana o detiene el mensaje, cancelamos limpiamente
             logger.info("Streaming cancelado por el cliente (WebSocket desconectado o abortado).")
             raise
 
         except APIError as e:
-            # Errores HTTP explícitos devueltos por Google (429 cuota, 400 bad request, 503 caído, etc.)
             logger.error("Error de API Gemini (HTTP %s): %s", e.code, e.message, exc_info=True)  # noqa: G201
 
             if e.code == 429:
@@ -209,15 +239,13 @@ class LLMService:
                 yield "\n[El servicio de IA de Google no está disponible temporalmente. Intenta más tarde.]"
 
         except ValueError as e:
-            # El SDK lanza ValueError si intentas leer `chunk.text` cuando la respuesta fue bloqueada por seguridad
             logger.warning("Respuesta bloqueada por filtros de seguridad o contenido vacío: %s", e)
             yield "\n[No pude completar la respuesta debido a restricciones de seguridad en el contenido.]"
 
         except Exception:
-            # Red de seguridad final: registra el traceback completo en consola/archivo sin exponerlo al frontend
             logger.exception("Error inesperado durante el streaming con Halibel")
             yield "\n[Ocurrió un error interno inesperado al procesar tu mensaje.]"
-            return  # Evitamos intentar registrar métricas si el flujo falló a mitad
+            return
 
         finally:
             # Aislamos el guardado en SQLite: si la BD falla, el chat NO se rompe
