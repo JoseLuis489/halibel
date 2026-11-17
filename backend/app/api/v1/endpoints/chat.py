@@ -1,17 +1,87 @@
 import asyncio
 import json
 import logging
+import os  # noqa: F401
+import secrets
 from typing import Any, Literal
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import StreamingResponse
 from fastapi.websockets import WebSocketState
 from pydantic import BaseModel, Field, ValidationError
 
+from app.core.config import settings
 from app.services.llm import llm_service
+from app.services.memory import memory_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# =====================================================================
+# SEGURIDAD DE CONEXIÓN WEBSOCKET (ANTI-CSWSH + HANDSHAKE SECRET)
+# =====================================================================
+
+ALLOWED_WS_ORIGINS = frozenset({
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+    "app://.",
+    "file://",
+    "null",
+})
+
+# Mismo token efímero inyectado por Electron al levantar el proceso hijo (Sidecar)
+HANDSHAKE_SECRET: str | None = settings.HALIBEL_IPC_SECRET
+
+
+def _is_authorized_websocket(websocket: WebSocket) -> bool:
+    """
+    Verifica la legitimidad de una solicitud de conexión WebSocket antes de aceptarla.
+    - Qué es: Barrera defensiva contra Cross-Site WebSocket Hijacking (CSWSH).
+    - Para qué se usa:
+        1. Rechazar cualquier navegador externo cuyo encabezado `Origin` no pertenezca a Halibel.
+        2. Validar el token efímero `HALIBEL_IPC_SECRET` si está configurado en el entorno.
+    - Nota: Si `Origin` es `None` (clientes nativos o TestClient de Pytest), se permite si pasa el token.
+    """
+    origin = websocket.headers.get("origin")
+    if origin is not None:
+        # Normalizamos quitando barra final por si algún entorno envía "app://./"
+        normalized_origin = origin.rstrip("/")
+        allowed_normalized = {o.rstrip("/") for o in ALLOWED_WS_ORIGINS}
+        # En Electron empaquetado cargando desde disco, Origin puede llegar como "file://" o "null"
+        if normalized_origin not in allowed_normalized and not origin.startswith("file://"):
+            logger.warning("Conexión WebSocket rechazada por Origin no autorizado: '%s'", origin)
+            return False
+
+    # Si hay secreto IPC activo (producción / Electron), exigir coincidencia exacta en tiempo constante
+    if HANDSHAKE_SECRET:
+        provided_token = websocket.query_params.get("token") or websocket.headers.get("x-halibel-secret")
+        if not provided_token or not secrets.compare_digest(provided_token, HANDSHAKE_SECRET):
+            logger.warning("Conexión WebSocket rechazada por Handshake Secret inválido o ausente.")
+            return False
+
+    return True
+
+
+def _clean_response_for_memory(raw_text: str) -> str:
+    """
+    Elimina las etiquetas efímeras de estado de herramientas antes de persistir en SQLite,
+    evitando que el modelo vea sus propios indicadores visuales en el historial futuro.
+    """
+    status_prefixes = (
+        "🔍 *[Consultando:",
+        "🧠 *[Actualizando memoria:",
+        "⚙️ *[Ejecutando:",
+        "⚠️ *[Solicitando autorización",
+        "*[Acción autorizada",
+        "*[Acción cancelada",
+    )
+    cleaned_lines = [
+        line for line in raw_text.splitlines()
+        if not line.strip().startswith(status_prefixes)
+    ]
+    return "\n".join(cleaned_lines).strip()
 
 
 # =====================================================================
@@ -36,13 +106,20 @@ class ChatRequest(BaseModel):
 class WSIncomingMessage(BaseModel):
     """
     Contrato tipado para mensajes entrantes por WebSocket.
-    Preparado para soportar múltiples tipos de eventos en la Fase 2.
+    Soporta eventos de chat, cancelación, aprobación interactiva y sincronización de historial.
     """
 
-    type: Literal["chat", "cancel", "tool_approval_response"] = "chat"
+    type: Literal[
+        "chat",
+        "cancel",
+        "tool_approval_response",
+        "get_history",
+        "clear_history",
+    ] = "chat"
     message: str = ""
+    session_id: str = "default_session"
     history: list[Message] = Field(default_factory=list)
-    # Campos reservados para Fase 2 (aprobación de herramientas):
+    # Campos para autorización interactiva (Human-in-the-Loop):
     tool_call_id: str | None = None
     approved: bool | None = None
 
@@ -98,12 +175,18 @@ async def websocket_chat(websocket: WebSocket):
     Canal WebSocket bidireccional de baja latencia con el cliente Electron.
     - Qué es: Conexión persistente full-duplex sobre TCP (/api/v1/ws/chat).
     - Para qué se usa:
-        1. Recibir y validar mensajes del usuario o comandos de control (cancelación / aprobación).
-        2. Ejecutar el streaming del LLM en una tarea asíncrona independiente para no bloquear la lectura.
-        3. Cancelar inmediatamente la generación si el usuario aborta o cierra la ventana (ahorro de tokens).
+        1. Validar Origin y Handshake Secret antes de aceptar el handshake WebSocket (anti-CSWSH).
+        2. Recibir y validar mensajes del usuario o comandos de control (cancelación / aprobación).
+        3. Ejecutar el streaming del LLM en una tarea asíncrona independiente para no bloquear la lectura.
+        4. Cancelar inmediatamente la generación si el usuario aborta o cierra la ventana (ahorro de tokens).
     """
+    # BARRERA ANTI-CSWSH: Validar origen y secreto ANTES de aceptar el socket
+    if not _is_authorized_websocket(websocket):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Origin or token not authorized")
+        return
+
     await websocket.accept()
-    logger.info("Cliente conectado al WebSocket de chat.")
+    logger.info("Cliente autorizado conectado al WebSocket de chat.")
 
     # Referencia a la tarea de streaming activa para poder cancelarla si el cliente se desconecta o aborta
     active_stream_task: asyncio.Task | None = None
@@ -146,61 +229,39 @@ async def websocket_chat(websocket: WebSocket):
         finally:
             pending_approvals.pop(call_id, None)
 
-    # Diccionario de promesas asíncronas pendientes de aprobación humana (Human-in-the-Loop)
-    pending_approvals: dict[str, asyncio.Future[bool]] = {}
-
-    async def on_approval_request(call_id: str, tool_name: str, args: dict[str, Any], description: str) -> bool:  # noqa: F811
-        """
-        Solicita autorización interactiva al usuario a través del canal WebSocket.
-        - Qué es: Callback asíncrono para herramientas destructivas (Human-in-the-Loop).
-        - Para qué se usa: Enviar la solicitud de confirmación a la UI de Electron y suspender la ejecución
-          hasta que el usuario responda o se alcance el tiempo de espera preventivo (timeout).
-        - Qué conecta: Conecta el bucle de herramientas en `llm_service` con el frontend React.
-        """
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[bool] = loop.create_future()
-        pending_approvals[call_id] = future
-
-        sent = await _safe_send_json(
-            websocket,
-            {
-                "type": "tool_approval_request",
-                "tool_call_id": call_id,
-                "tool": tool_name,
-                "args": args,
-                "description": description,
-            },
-        )
-        if not sent:
-            pending_approvals.pop(call_id, None)
-            return False
-
-        try:
-            # Espera máxima de 120 segundos para que el usuario responda en la interfaz
-            return await asyncio.wait_for(future, timeout=120.0)
-        except TimeoutError:
-            logger.warning("Tiempo de espera agotado (120s) para la aprobación de herramienta: %s", call_id)
-            return False
-        finally:
-            pending_approvals.pop(call_id, None)
-
-    async def run_llm_stream(user_msg: str, history_data: list[dict[str, str]]) -> None:
-        """Corrutina aislada que consume el generador de Gemini y envía chunks al cliente."""
+    async def run_llm_stream(
+        user_msg: str,
+        history_data: list[dict[str, str]],
+        session_id: str = "default_session",
+    ) -> None:
+        """Corrutina aislada que consume el generador de Gemini, envía chunks y persiste el diálogo."""
         if not await _safe_send_json(websocket, {"type": "stream_start"}):
             return
 
+        accumulated_chunks: list[str] = []
         try:
             async for chunk in llm_service.stream_message(
                 user_msg,
                 history=history_data,
                 on_approval_request=on_approval_request,
             ):
+                accumulated_chunks.append(chunk)
                 sent = await _safe_send_json(websocket, {"type": "chunk", "content": chunk})
                 if not sent:
                     # Si falló el envío porque el cliente cayó, cortamos el generador inmediatamente
                     break
 
             await _safe_send_json(websocket, {"type": "stream_end"})
+
+            # Persistencia limpia de la respuesta del asistente en SQLite local sin bloquear asyncio
+            full_response = _clean_response_for_memory("".join(accumulated_chunks))
+            if full_response:
+                await asyncio.to_thread(
+                    memory_service.save_message,
+                    session_id=session_id,
+                    role="model",
+                    content=full_response,
+                )
 
         except asyncio.CancelledError:
             # Propagación limpia: esto dispara el `except asyncio.CancelledError` dentro de llm_service
@@ -231,6 +292,20 @@ async def websocket_chat(websocket: WebSocket):
                 continue
 
             # 2. Enrutamiento por tipo de evento
+            if payload.type == "get_history":
+                msgs = await asyncio.to_thread(
+                    memory_service.get_session_messages, payload.session_id, 50
+                )
+                await _safe_send_json(websocket, {"type": "history", "messages": msgs})
+                continue
+
+            if payload.type == "clear_history":
+                await asyncio.to_thread(
+                    memory_service.clear_session_messages, payload.session_id
+                )
+                await _safe_send_json(websocket, {"type": "history_cleared"})
+                continue
+
             if payload.type == "cancel":
                 if active_stream_task and not active_stream_task.done():
                     logger.info("Solicitud de cancelación recibida desde el cliente.")
@@ -257,9 +332,17 @@ async def websocket_chat(websocket: WebSocket):
                 if active_stream_task and not active_stream_task.done():
                     active_stream_task.cancel()
 
+                # Persistir mensaje del usuario en la base de datos local sin bloquear el loop
+                await asyncio.to_thread(
+                    memory_service.save_message,
+                    session_id=payload.session_id,
+                    role="user",
+                    content=payload.message,
+                )
+
                 history_dicts = [{"role": m.role, "content": m.content} for m in payload.history]
                 active_stream_task = asyncio.create_task(
-                    run_llm_stream(payload.message, history_dicts)
+                    run_llm_stream(payload.message, history_dicts, payload.session_id)
                 )
 
     except WebSocketDisconnect:

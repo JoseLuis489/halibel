@@ -27,3 +27,67 @@ def test_websocket_cancel_and_approval():
         assert err_msg["type"] == "error"
         assert "inválido" in err_msg["error"]
 
+
+def test_websocket_history_sync():
+    """Prueba la sincronización de historial a través del canal WebSocket."""
+    with client.websocket_connect("/api/v1/ws/chat") as websocket:
+        # Solicitar historial
+        websocket.send_json({"type": "get_history", "session_id": "test_ws_session"})
+        resp = websocket.receive_json()
+        assert resp["type"] == "history"
+        assert isinstance(resp["messages"], list)
+
+        # Vaciar historial
+        websocket.send_json({"type": "clear_history", "session_id": "test_ws_session"})
+        ack = websocket.receive_json()
+        assert ack["type"] == "history_cleared"
+
+
+def test_memories_rest_api():
+    """Prueba los endpoints REST de consulta y guardado de memorias a largo plazo."""
+    # 1. Crear memoria vía POST
+    post_res = client.post(
+        "/api/v1/memories",
+        json={
+            "category": "preference",
+            "content": "Prefiere té verde sobre café",
+            "key": "drink_preference",
+            "importance": 2,
+        },
+    )
+    assert post_res.status_code == 200
+    data = post_res.json()
+    assert data["key"] == "drink_preference"
+    mem_id = data["id"]
+
+    # 2. Consultar memoria vía GET
+    get_res = client.get("/api/v1/memories", params={"query": "té verde"})
+    assert get_res.status_code == 200
+    mems = get_res.json()
+    assert len(mems) >= 1
+    assert any(m["key"] == "drink_preference" for m in mems)
+
+    # 3. Eliminar memoria vía DELETE
+    del_res = client.delete(f"/api/v1/memories/{mem_id}")
+    assert del_res.status_code == 200
+    assert del_res.json()["status"] == "success"
+
+    # 4. Intentar eliminar id inexistente -> 404
+    del_404 = client.delete("/api/v1/memories/999999")
+    assert del_404.status_code == 404
+
+
+def test_chat_history_rest_api():
+    """Prueba los endpoints REST de historial de chat."""
+    session_id = "rest_test_session"
+    # Consultar historial
+    res_get = client.get("/api/v1/chat/history", params={"session_id": session_id})
+    assert res_get.status_code == 200
+    assert isinstance(res_get.json(), list)
+
+    # Vaciar historial
+    res_del = client.delete("/api/v1/chat/history", params={"session_id": session_id})
+    assert res_del.status_code == 200
+    assert res_del.json()["cleared"] is True
+
+
