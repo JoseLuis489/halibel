@@ -1,5 +1,6 @@
 import fnmatch
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -10,11 +11,14 @@ logger = logging.getLogger(__name__)
 # Límite máximo de tamaño de archivo para lectura (500 KB) para proteger el contexto y la memoria
 MAX_READ_FILE_SIZE_BYTES = 500 * 1024
 
+# Límite máximo de tamaño de archivo para escritura (2 MB) para prevenir escrituras excesivas
+MAX_WRITE_FILE_SIZE_BYTES = 2 * 1024 * 1024
+
 # =====================================================================
-# POLÍTICA DE SEGURIDAD: PERÍMETRO ANTI-EXFILTRACIÓN DE SECRETOS
+# POLÍTICA DE SEGURIDAD: PERÍMETRO ANTI-EXFILTRACIÓN Y ANTI-PERSISTENCIA
 # =====================================================================
 
-# Carpetas cuyo acceso (lectura, listado o borrado) está estrictamente prohibido en cualquier nivel
+# Carpetas cuyo acceso (lectura, listado, escritura o borrado) está prohibido en cualquier nivel
 BLOCKED_DIR_NAMES = frozenset({
     ".git",
     ".ssh",
@@ -27,7 +31,6 @@ BLOCKED_DIR_NAMES = frozenset({
 })
 
 # Patrones precisos de archivos de credenciales y configuración sensible (case-insensitive)
-# Evita comodines demasiado amplios (*secret*) para no bloquear notas personales del usuario
 BLOCKED_FILE_PATTERNS = (
     ".env",
     ".env.*",
@@ -66,13 +69,98 @@ BLOCKED_EXTENSIONS = frozenset({
     ".kdbx",
 })
 
+# Archivos de configuración de shell y autoarranque de sesión (anti-persistencia por Prompt Injection)
+BLOCKED_STARTUP_FILENAMES = frozenset({
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".profile",
+    ".zshrc",
+    ".zprofile",
+    ".zshenv",
+    ".kshrc",
+    ".cshrc",
+    ".tcshrc",
+    "config.fish",
+    "authorized_keys",
+    "crontab",
+})
 
-def _check_security_policy(target_path: Path) -> str | None:
+# Extensiones ejecutables o de scripting que exigen supervisión humana obligatoria (Human-in-the-Loop)
+SENSITIVE_EXECUTABLE_EXTENSIONS = frozenset({
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".bat",
+    ".cmd",
+    ".ps1",
+    ".psm1",
+    ".vbs",
+    ".vbe",
+    ".js",
+    ".jse",
+    ".wsf",
+    ".wsh",
+    ".exe",
+    ".msi",
+    ".scr",
+    ".com",
+    ".reg",
+})
+
+
+def _is_system_or_startup_path(resolved_path: Path) -> str | None:
     """
-    Evalúa si una ruta viola la política de protección de secretos.
+    Detecta si la ruta apunta a directorios críticos del sistema operativo o carpetas de autoarranque
+    (Windows Startup, systemd, cron, /etc, /usr, C:\\Windows, etc.).
+    """
+    normalized_posix = resolved_path.as_posix().lower()
+    name_lower = resolved_path.name.lower()
+
+    # 1. Archivos de inicialización de shell (~/.bashrc, ~/.zshrc, ~/.profile, etc.)
+    if name_lower in BLOCKED_STARTUP_FILENAMES:
+        return f"Acceso denegado: '{resolved_path.name}' es un archivo de inicio del sistema/shell protegido."
+
+    # 2. Carpeta Startup de Windows (AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup)
+    if "start menu/programs/startup" in normalized_posix or "microsoft/windows/start menu" in normalized_posix:
+        return "Acceso denegado: la carpeta de autoarranque (Startup) de Windows está protegida."
+
+    # 3. Rutas de autoarranque en Linux/macOS (autostart, LaunchAgents, LaunchDaemons, systemd, cron)
+    startup_subpaths = (
+        "/.config/autostart",
+        "/library/launchagents",
+        "/library/launchdaemons",
+        "/etc/systemd",
+        "/etc/init.d",
+        "/etc/cron",
+    )
+    if any(sub in normalized_posix for sub in startup_subpaths):
+        return "Acceso denegado: los directorios de servicios y autoarranque del sistema están protegidos."
+
+    # 4. Directorios raíz críticos de Windows
+    if os.name == "nt":
+        win_dir = Path(os.environ.get("SystemRoot", "C:\\Windows")).resolve()
+        prog_files = Path(os.environ.get("ProgramFiles", "C:\\Program Files")).resolve()
+        prog_files_x86 = Path(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")).resolve()
+        for protected_root in (win_dir, prog_files, prog_files_x86):
+            if resolved_path == protected_root or protected_root in resolved_path.parents:
+                return f"Acceso denegado: el directorio del sistema '{protected_root}' está protegido."
+
+    # 5. Directorios raíz críticos de Unix/Linux/macOS
+    unix_protected_roots = ("/etc", "/usr", "/bin", "/sbin", "/boot", "/dev", "/proc", "/sys", "/system")
+    for root_prefix in unix_protected_roots:
+        if normalized_posix == root_prefix or normalized_posix.startswith(f"{root_prefix}/"):
+            return f"Acceso denegado: el directorio del sistema '{root_prefix}' está protegido."
+
+    return None
+
+
+def _check_security_policy(target_path: Path, is_write: bool = False) -> str | None:
+    """
+    Evalúa si una ruta viola la política de protección de secretos o integridad del sistema.
     - Qué es: Barrera de seguridad determinista previa a cualquier operación de I/O.
-    - Para qué se usa: Bloquear el acceso a archivos de credenciales, llaves SSH, variables de entorno
-      o bases de datos internas, incluso si se intenta acceder mediante enlaces simbólicos o rutas relativas.
+    - Para qué se usa: Bloquear el acceso a archivos de credenciales, llaves SSH, bases de datos internas,
+      rutas de autoarranque y directorios críticos del SO.
     - Retorna: Un mensaje de error si el acceso está bloqueado, o `None` si la ruta es segura.
     """
     # 1. Verificar si algún directorio padre o el propio destino pertenece a carpetas críticas
@@ -94,7 +182,39 @@ def _check_security_policy(target_path: Path) -> str | None:
             logger.warning("Bloqueo de seguridad activado (patrón '%s'): %s", pattern, target_path)
             return f"Acceso denegado por política de seguridad: '{target_path.name}' contiene información sensible."
 
+    # 4. Verificar rutas del sistema operativo y archivos de autoarranque (especialmente crítico en escritura/borrado)
+    system_error = _is_system_or_startup_path(target_path)
+    if system_error and (is_write or target_path.name.lower() in BLOCKED_STARTUP_FILENAMES):
+        logger.warning("Bloqueo de seguridad activado (ruta de sistema/autoarranque): %s", target_path)
+        return system_error
+
     return None
+
+
+def is_sensitive_write_target(path: str, overwrite: bool = False) -> tuple[bool, str]:
+    """
+    Helper público para `registry.py` y `llm.py`: determina si una operación `write_file`
+    debe exigir aprobación humana (Human-in-the-Loop) antes de ejecutarse.
+    - Exige confirmación si:
+        1. El archivo destino es un script o ejecutable (.sh, .bat, .cmd, .ps1, .vbs, .exe, etc.).
+        2. Se va a sobrescribir (`overwrite=True`) un archivo existente.
+    """
+    resolved_path = Path(path).expanduser().resolve()
+    ext = resolved_path.suffix.lower()
+
+    if ext in SENSITIVE_EXECUTABLE_EXTENSIONS:
+        return (
+            True,
+            f"Halibel solicita crear o modificar un archivo ejecutable/script ('{resolved_path.name}').",
+        )
+
+    if resolved_path.exists() and resolved_path.is_file():
+        return (
+            True,
+            f"Halibel solicita sobrescribir el archivo existente '{resolved_path.name}'.",
+        )
+
+    return False, ""
 
 
 # =====================================================================
@@ -254,7 +374,10 @@ def safe_delete_file(path: str) -> dict[str, Any]:
         resolved_path = raw_path.resolve()
 
         # Verificamos tanto la ruta solicitada como su destino real contra la política de seguridad
-        security_error = _check_security_policy(resolved_path) or _check_security_policy(raw_path)
+        security_error = (
+            _check_security_policy(resolved_path, is_write=True)
+            or _check_security_policy(raw_path, is_write=True)
+        )
         if security_error:
             return {"status": "error", "error": security_error}
 
@@ -298,3 +421,92 @@ def safe_delete_file(path: str) -> dict[str, Any]:
     except Exception as e:
         logger.exception("Error inesperado en safe_delete_file para '%s'", path)
         return {"status": "error", "error": f"Error al enviar a la papelera: {e!s}"}
+
+
+def write_file(
+    path: str,
+    content: str,
+    overwrite: bool = False,
+    allow_executable: bool = False,
+) -> dict[str, Any]:
+    """
+    Crea un nuevo archivo de texto o actualiza uno existente de manera controlada y segura.
+    - Qué es: Herramienta de creación y edición controlada del sistema de archivos.
+    - Para qué se usa: Permitir a Halibel escribir scripts, notas, documentos o configuraciones locales.
+      Aplica el perímetro anti-exfiltración de secretos, bloquea rutas del sistema/autoarranque
+      y exige autorización explícita para sobrescritura o scripts ejecutables.
+    - Qué conecta: Crea o modifica archivos en el almacenamiento local del sistema operativo.
+    """
+    try:
+        content_bytes = content.encode("utf-8")
+        if len(content_bytes) > MAX_WRITE_FILE_SIZE_BYTES:
+            return {
+                "status": "error",
+                "error": (
+                    f"El contenido ({len(content_bytes)} bytes) excede el tamaño máximo permitido de "
+                    f"{MAX_WRITE_FILE_SIZE_BYTES // (1024 * 1024)} MB."
+                ),
+            }
+
+        raw_path = Path(path).expanduser()
+        resolved_path = raw_path.resolve()
+
+        # 1. Evaluación estricta de política de seguridad (secretos + autoarranque + sistema)
+        security_error = (
+            _check_security_policy(resolved_path, is_write=True)
+            or _check_security_policy(raw_path, is_write=True)
+        )
+        if security_error:
+            return {"status": "error", "error": security_error}
+
+        # 2. Barrera para extensiones ejecutables o scripts (.sh, .bat, .cmd, .ps1, .vbs, .exe, etc.)
+        if resolved_path.suffix.lower() in SENSITIVE_EXECUTABLE_EXTENSIONS and not allow_executable:
+            logger.warning("Escritura de ejecutable bloqueada sin autorización previa: %s", resolved_path)
+            return {
+                "status": "error",
+                "error": (
+                    f"Por seguridad, escribir archivos ejecutables o scripts ('{resolved_path.suffix}') "
+                    "requiere autorización humana explícita (allow_executable=True)."
+                ),
+                "requires_approval": True,
+            }
+
+        # 3. Protección contra sobrescritura accidental
+        if resolved_path.exists():
+            if resolved_path.is_dir():
+                return {
+                    "status": "error",
+                    "error": f"La ruta '{path}' es un directorio existente. No se puede sobrescribir con un archivo.",
+                }
+            if not overwrite:
+                return {
+                    "status": "error",
+                    "error": (
+                        f"El archivo '{resolved_path.name}' ya existe en esa ubicación. "
+                        "Para sobrescribirlo, debes confirmar explícitamente indicando overwrite=True."
+                    ),
+                    "already_exists": True,
+                }
+
+        # Asegurar creación de subdirectorios intermedios
+        resolved_path.parent.mkdir(parents=True, exist_ok=True)
+
+        resolved_path.write_text(content, encoding="utf-8")
+        logger.info("Archivo escrito con éxito: %s (%d bytes)", resolved_path, len(content_bytes))
+
+        return {
+            "status": "success",
+            "message": f"Archivo '{resolved_path.name}' guardado correctamente.",
+            "path": str(resolved_path),
+            "bytes_written": len(content_bytes),
+        }
+
+    except PermissionError:
+        logger.warning("Permiso denegado al escribir en '%s'", path)
+        return {"status": "error", "error": f"Permiso denegado por el sistema para escribir en '{path}'."}
+    except OSError as e:
+        logger.exception("Error de sistema operativo en write_file para '%s'", path)
+        return {"status": "error", "error": f"Error de sistema operativo al escribir el archivo: {e!s}"}
+    except Exception as e:
+        logger.exception("Error inesperado en write_file para '%s'", path)
+        return {"status": "error", "error": f"Error inesperado al escribir el archivo: {e!s}"}
