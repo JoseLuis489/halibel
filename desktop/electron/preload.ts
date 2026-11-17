@@ -14,4 +14,6 @@ contextBridge.exposeInMainWorld('halibelAPI', {
   close: () => ipcRenderer.invoke('window:close'),
   // Ajusta las dimensiones de la ventana (ej. 100x100 para solo la esfera, 360x520 con el chat abierto)
   resize: (width: number, height: number) => ipcRenderer.invoke('window:resize', width, height),
+  // Obtiene el token efímero generado por Electron para autenticación con el runtime FastAPI
+  getIpcToken: () => ipcRenderer.invoke('auth:get-token'),
 })

@@ -1,5 +1,17 @@
 import React, { useState, useEffect, useRef } from 'react'
-import { Send, X, Minus, Sparkles, Square, WifiOff, AlertTriangle, Check, ArrowDown } from 'lucide-react'
+import {
+  Send,
+  X,
+  Minus,
+  Sparkles,
+  Square,
+  WifiOff,
+  AlertTriangle,
+  Check,
+  ArrowDown,
+  RotateCcw,
+  Brain,
+} from 'lucide-react'
 
 // Estructura de solicitud de autorización de herramientas (Human-in-the-Loop)
 interface ToolApprovalRequest {
@@ -30,6 +42,7 @@ declare global {
       minimize: () => Promise<void>
       close: () => Promise<void>
       resize: (width: number, height: number) => Promise<void>
+      getIpcToken: () => Promise<string>
     }
   }
 }
@@ -127,8 +140,9 @@ function FormattedMessage({ content }: { content: string }) {
  * - Qué es: Componente funcional de React que gestiona el estado visual de la esfera y el panel de conversación.
  * - Para qué se usa:
  *     1. Mostrar la esfera interactiva con animaciones de respiración, pensamiento, habla o desconexión.
- *     2. Renderizar el panel de chat con soporte de formato Markdown, tarjetas Human-in-the-Loop y scroll inteligente.
- *     3. Gestionar una única conexión WebSocket resiliente con backoff exponencial y cancelación.
+ *     2. Renderizar el panel de chat con formato Markdown, tarjetas Human-in-the-Loop y scroll inteligente.
+ *     3. Mostrar notificaciones sutiles cuando Halibel guarda un nuevo recuerdo o preferencia.
+ *     4. Gestionar una única conexión WebSocket resiliente con backoff exponencial y cancelación.
  * - Qué conecta: Conecta la UI con Electron (`preload.ts`) y el endpoint `ws://127.0.0.1:8000/api/v1/ws/chat`.
  */
 export default function App() {
@@ -143,9 +157,11 @@ export default function App() {
   const [state, setState] = useState<CompanionState>('idle')
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('connecting')
   const [showScrollBottom, setShowScrollBottom] = useState(false)
+  const [memoryToast, setMemoryToast] = useState<string | null>(null)
 
   const socketRef = useRef<WebSocket | null>(null)
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const memoryToastTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const reconnectAttemptsRef = useRef<number>(0)
 
   // Referencias para el Auto-Scroll Inteligente
@@ -153,8 +169,21 @@ export default function App() {
   const isUserNearBottomRef = useRef<boolean>(true)
 
   /**
+   * Dispara una notificación visual sutil y no intrusiva cuando Halibel aprende o actualiza un recuerdo.
+   */
+  const triggerMemoryNotification = (label = 'Halibel aprendió una nueva preferencia') => {
+    setMemoryToast(label)
+    if (memoryToastTimeoutRef.current) {
+      clearTimeout(memoryToastTimeoutRef.current)
+    }
+    memoryToastTimeoutRef.current = setTimeout(() => {
+      setMemoryToast(null)
+      memoryToastTimeoutRef.current = null
+    }, 4200)
+  }
+
+  /**
    * Detecta si el usuario está cerca del fondo del contenedor o si subió manualmente a leer.
-   * - Umbral de 60px: si está a menos de 60px del borde inferior, se considera "anclado al final".
    */
   const handleChatScroll = () => {
     const container = chatContainerRef.current
@@ -169,7 +198,7 @@ export default function App() {
   }
 
   /**
-   * Desplaza el contenedor hasta el final de forma controlada (al enviar mensaje o pulsar el botón).
+   * Desplaza el contenedor hasta el final de forma controlada.
    */
   const scrollToBottom = (behavior: ScrollBehavior = 'smooth') => {
     const container = chatContainerRef.current
@@ -186,7 +215,6 @@ export default function App() {
   /**
    * Auto-desplazamiento inteligente:
    * - Solo acompaña el streaming si el usuario NO ha subido manualmente a leer arriba.
-   * - Usa 'auto' (instantáneo) durante el streaming para evitar el lag de animaciones encadenadas.
    */
   useEffect(() => {
     if (isUserNearBottomRef.current) {
@@ -216,7 +244,7 @@ export default function App() {
   useEffect(() => {
     let isMounted = true
 
-    const connectWS = () => {
+    const connectWS = async () => {
       if (!isMounted) return
 
       if (socketRef.current) {
@@ -225,7 +253,21 @@ export default function App() {
       }
 
       setConnectionStatus('connecting')
-      const ws = new WebSocket('ws://127.0.0.1:8000/api/v1/ws/chat')
+
+      let wsUrl = 'ws://127.0.0.1:8000/api/v1/ws/chat'
+      if (window.halibelAPI?.getIpcToken) {
+        try {
+          const token = await window.halibelAPI.getIpcToken()
+          if (token) {
+            wsUrl += `?token=${encodeURIComponent(token)}`
+          }
+        } catch (err) {
+          console.warn('No se pudo obtener el token IPC de Electron:', err)
+        }
+      }
+
+      if (!isMounted) return
+      const ws = new WebSocket(wsUrl)
       socketRef.current = ws
 
       ws.onopen = () => {
@@ -236,6 +278,9 @@ export default function App() {
         console.log('Conectado al runtime local de Halibel')
         setConnectionStatus('connected')
         reconnectAttemptsRef.current = 0
+
+        // Sincronizar historial persistente de la sesión al conectar
+        ws.send(JSON.stringify({ type: 'get_history', session_id: 'default_session' }))
       }
 
       ws.onmessage = (event) => {
@@ -243,11 +288,37 @@ export default function App() {
         try {
           const data = JSON.parse(event.data)
 
-          if (data.type === 'stream_start') {
+          if (data.type === 'history') {
+            if (Array.isArray(data.messages) && data.messages.length > 0) {
+              setMessages(
+                data.messages.map((m: { role: string; content: string }) => ({
+                  role: m.role === 'user' ? 'user' : 'halibel',
+                  content: m.content,
+                }))
+              )
+            }
+          } else if (data.type === 'history_cleared') {
+            setMessages([
+              {
+                role: 'halibel',
+                content: 'Conversación reiniciada. ¿En qué puedo acompañarte u organizarte hoy?',
+              },
+            ])
+          } else if (data.type === 'memory_updated') {
+            // Evento directo opcional del backend al actualizar memoria
+            triggerMemoryNotification('Halibel aprendió una nueva preferencia')
+          } else if (data.type === 'stream_start') {
             setState('speaking')
             setMessages((prev) => [...prev, { role: 'halibel', content: '' }])
           } else if (data.type === 'chunk') {
             setState('speaking')
+            const chunkText = String(data.content || '')
+
+            // Detectar invocación de herramientas de memoria emitidas por `llm.py`
+            if (chunkText.includes('Actualizando memoria:')) {
+              triggerMemoryNotification('Halibel aprendió una nueva preferencia')
+            }
+
             setMessages((prev) => {
               if (prev.length === 0) return prev
               const lastIndex = prev.length - 1
@@ -255,11 +326,10 @@ export default function App() {
               if (!last || last.role !== 'halibel') return prev
               return [
                 ...prev.slice(0, lastIndex),
-                { ...last, content: last.content + data.content },
+                { ...last, content: last.content + chunkText },
               ]
             })
           } else if (data.type === 'tool_approval_request') {
-            // Si llega una solicitud de confirmación crítica, bajamos el scroll para que el usuario la vea
             isUserNearBottomRef.current = true
             setState('thinking')
             setMessages((prev) => [
@@ -317,6 +387,10 @@ export default function App() {
         clearTimeout(reconnectTimeoutRef.current)
         reconnectTimeoutRef.current = null
       }
+      if (memoryToastTimeoutRef.current) {
+        clearTimeout(memoryToastTimeoutRef.current)
+        memoryToastTimeoutRef.current = null
+      }
       if (socketRef.current) {
         socketRef.current.onclose = null
         socketRef.current.close()
@@ -364,13 +438,33 @@ export default function App() {
   }
 
   /**
+   * Vacía el historial de la conversación actual tanto en la vista como en SQLite.
+   */
+  const clearChat = () => {
+    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+      socketRef.current.send(
+        JSON.stringify({
+          type: 'clear_history',
+          session_id: 'default_session',
+        })
+      )
+    } else {
+      setMessages([
+        {
+          role: 'halibel',
+          content: 'Conversación reiniciada. ¿En qué puedo acompañarte u organizarte hoy?',
+        },
+      ])
+    }
+  }
+
+  /**
    * Envía el mensaje del usuario al modelo de IA a través del WebSocket.
    */
   const sendMessage = () => {
     if (!input.trim() || state !== 'idle') return
 
     const userText = input.trim()
-    // Al enviar un mensaje nuevo, reactivamos el anclaje al final del chat
     isUserNearBottomRef.current = true
     setShowScrollBottom(false)
 
@@ -380,7 +474,6 @@ export default function App() {
     setState('thinking')
 
     if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-      // Filtramos mensajes vacíos (como tarjetas de aprobación sin texto) para no ensuciar el historial
       const validHistory = messages
         .filter((m) => m.content.trim().length > 0)
         .slice(-8)
@@ -451,6 +544,13 @@ export default function App() {
             <div className="header-actions">
               <button
                 className="btn-icon"
+                onClick={clearChat}
+                title="Reiniciar conversación"
+              >
+                <RotateCcw size={14} />
+              </button>
+              <button
+                className="btn-icon"
                 onClick={() => window.halibelAPI?.minimize()}
                 title="Minimizar"
               >
@@ -465,6 +565,32 @@ export default function App() {
               </button>
             </div>
           </div>
+
+          {/* Notificación sutil en tiempo real cuando Halibel guarda un recuerdo o preferencia */}
+          {memoryToast && (
+            <div
+              role="status"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: '6px',
+                padding: '5px 10px',
+                margin: '6px 12px 0',
+                borderRadius: '8px',
+                fontSize: '11.5px',
+                color: '#c4b5fd',
+                background: 'rgba(139, 92, 246, 0.16)',
+                border: '1px solid rgba(139, 92, 246, 0.35)',
+                backdropFilter: 'blur(8px)',
+                boxShadow: '0 2px 10px rgba(0, 0, 0, 0.25)',
+                transition: 'opacity 0.25s ease',
+              }}
+            >
+              <Brain size={13} color="#a78bfa" />
+              <span>{memoryToast}</span>
+            </div>
+          )}
 
           {/* Área de historial de mensajes con detección inteligente de scroll */}
           <div

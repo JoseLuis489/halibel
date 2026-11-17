@@ -3,6 +3,17 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      Content Security Policy (CSP) estricta para Electron:
+      - Bloquea conexiones externas y carga de scripts remotos (`default-src 'self'`).
+      - Autoriza únicamente el runtime local de Halibel (127.0.0.1:8000 / localhost:8000)
+        y el servidor de desarrollo Vite HMR (5173).
+      - Permite estilos en línea (`'unsafe-inline'`) requeridos por React y el diseño Glassmorphism.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' http://127.0.0.1:8000 http://localhost:8000 ws://127.0.0.1:8000 ws://localhost:8000 http://localhost:5173 http://127.0.0.1:5173 ws://localhost:5173 ws://127.0.0.1:5173; object-src 'none'; base-uri 'self';"
+    />
     <title>Halibel</title>
   </head>
   <body>
