@@ -1,5 +1,6 @@
 import logging
 import sqlite3
+import sys
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
@@ -9,17 +10,26 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Ubicación del archivo de base de datos SQLite: backend/data/halibel.db
-DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
-DB_PATH = DATA_DIR / "halibel.db"
+# Ubicación unificada de la base de datos SQLite compartida con memory.py:
+# - En desarrollo: backend/data/halibel.db
+# - En producción empaquetada (PyInstaller): %APPDATA%/Halibel/halibel.db (settings.USER_DATA_DIR)
+_DEV_DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
+DB_PATH = (
+    settings.USER_DATA_DIR / "halibel.db"
+    if getattr(sys, "frozen", False)
+    else _DEV_DATA_DIR / "halibel.db"
+)
 
 # Precios oficiales por cada 1,000,000 tokens en USD (Google Gemini API)
-PRICING_PER_1M = {
+PRICING_PER_1M: dict[str, dict[str, float]] = {
     "gemini-3.5-flash-lite": {"input": 0.075, "output": 0.30},
     "gemini-3.8-flash": {"input": 0.15, "output": 0.60},
     "gemini-2.5-flash": {"input": 0.15, "output": 0.60},
+    "gemini-2.5-flash-lite": {"input": 0.075, "output": 0.30},
     "gemini-2.5-pro": {"input": 1.25, "output": 5.00},
 }
+
+DEFAULT_RATES = {"input": 0.075, "output": 0.30}
 
 
 class UsageService:
@@ -28,12 +38,16 @@ class UsageService:
     - Qué es: Gestor de persistencia en SQLite local optimizado con WAL para auditoría de tokens.
     - Para qué se usa: Almacenar cada interacción con el modelo, calcular el costo en dólares
       y alimentar el dashboard privado de monitoreo sin bloquear lecturas/escrituras concurrentes.
-    - Qué conecta: Recibe llamadas desde `llm_service.stream_message` y provee datos al endpoint
-      y panel web en `usage.py`.
+    - Qué conecta: Comparte `halibel.db` con `memory_service`, recibe llamadas desde `llm_service`
+      y provee métricas al panel web en `usage.py`.
     """
 
-    def __init__(self) -> None:
-        """Inicializa el servicio asegurando que la base de datos, el modo WAL y la tabla existan."""
+    def __init__(self, db_path: Path | str | None = None) -> None:
+        """
+        Inicializa el servicio asegurando que la base de datos, el modo WAL y la tabla existan.
+        Acepta `db_path` opcional para facilitar pruebas automatizadas aisladas.
+        """
+        self.db_path = Path(db_path) if db_path else DB_PATH
         self._ensure_db()
 
     def _get_connection(self) -> sqlite3.Connection:
@@ -43,7 +57,7 @@ class UsageService:
         - Para qué se usa: Aplicar `busy_timeout` y `synchronous=NORMAL` en cada sesión abierta,
           evitando errores de `database is locked` ante lecturas/escrituras simultáneas.
         """
-        conn = sqlite3.connect(DB_PATH, timeout=5.0)
+        conn = sqlite3.connect(self.db_path, timeout=5.0)
         conn.row_factory = sqlite3.Row
         # Configuraciones por sesión (deben ejecutarse en cada nueva conexión)
         conn.execute("PRAGMA busy_timeout = 5000;")
@@ -56,9 +70,9 @@ class UsageService:
         - Qué es: Función de inicialización DDL y configuración de motor en SQLite.
         - Para qué se usa: Habilitar lecturas y escrituras simultáneas (Write-Ahead Logging)
           y garantizar que el esquema exista sin scripts manuales.
-        - Qué conecta: Crea el archivo físico `halibel.db` en `backend/data/`.
+        - Qué conecta: Crea o abre el archivo físico unificado `halibel.db`.
         """
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             # `closing()` garantiza `conn.close()` al salir; `with conn:` gestiona commit/rollback
             with closing(self._get_connection()) as conn, conn:
@@ -81,7 +95,7 @@ class UsageService:
                     ON usage_logs (timestamp DESC)
                 """)
         except sqlite3.Error:
-            logger.exception("Error crítico al inicializar la base de datos SQLite en %s", DB_PATH)
+            logger.exception("Error crítico al inicializar la base de datos SQLite en %s", self.db_path)
 
     def calculate_cost(self, model: str, prompt_tokens: int, candidates_tokens: int) -> float:
         """
@@ -90,7 +104,11 @@ class UsageService:
         - Para qué se usa: Estimar con precisión de 6 decimales el gasto de entrada y salida.
         - Qué conecta: Utiliza la tabla `PRICING_PER_1M` y los tokens devueltos por Google.
         """
-        rates = PRICING_PER_1M.get(model, {"input": 0.075, "output": 0.30})
+        rates = PRICING_PER_1M.get(model)
+        if rates is None:
+            logger.debug("Modelo '%s' sin tarifa explícita en PRICING_PER_1M; usando tarifa base.", model)
+            rates = DEFAULT_RATES
+
         input_cost = (prompt_tokens / 1_000_000) * rates["input"]
         output_cost = (candidates_tokens / 1_000_000) * rates["output"]
         return round(input_cost + output_cost, 6)

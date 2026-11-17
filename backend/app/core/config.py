@@ -67,7 +67,7 @@ class Settings(BaseSettings):
     """
 
     PROJECT_NAME: str = "Halibel Runtime"
-    VERSION: str = "0.2.0"
+    VERSION: str = "0.3.0"
     ENVIRONMENT: str = "development"
     DEBUG: bool = True
     HOST: str = "127.0.0.1"
@@ -80,6 +80,9 @@ class Settings(BaseSettings):
     # Proveedor de Inteligencia Artificial
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-3.5-flash-lite"
+
+    # Seguridad local IPC (Handshake Secret compartido con Electron)
+    HALIBEL_IPC_SECRET: str | None = None
 
     # Directiva base de personalidad (System Prompt)
     HALIBEL_PERSONA: str = (

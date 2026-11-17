@@ -1,9 +1,15 @@
 from pathlib import Path
-from app.core.config import Settings, get_user_data_dir, resolve_active_env_path, settings
+
+from app.core.config import (
+    get_user_data_dir,
+    resolve_active_env_path,
+    settings,
+)
+
 
 def test_settings_initialization():
     assert settings.PROJECT_NAME == "Halibel Runtime"
-    assert settings.VERSION == "0.2.0"
+    assert settings.VERSION == "0.3.0"
     assert settings.PORT == 8000
     assert isinstance(settings.USER_DATA_DIR, Path)
     assert isinstance(settings.ACTIVE_ENV_FILE, Path)

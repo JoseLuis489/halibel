@@ -13,18 +13,31 @@ from google.genai import types
 from google.genai.errors import APIError
 
 from app.core.config import settings
+from app.services.memory import memory_service
 from app.services.usage import usage_service
-from app.tools.registry import AVAILABLE_TOOLS, execute_tool, is_destructive_tool
+from app.tools.registry import (
+    AVAILABLE_TOOLS,
+    execute_tool,
+    get_tool_approval_description,
+    is_destructive_tool,
+)
 
 logger = logging.getLogger(__name__)
+
+# Tiempo máximo (en segundos) permitido para que una herramienta de I/O responda
+TOOL_EXECUTION_TIMEOUT_SECONDS = 15.0
+
+# Presupuesto máximo de caracteres para el historial conversacional (~4,000 tokens aprox.)
+MAX_HISTORY_TOTAL_CHARS = 16_000
+MAX_SINGLE_HISTORY_MSG_CHARS = 4_000
 
 
 def _build_runtime_context() -> str:
     """
-    Construye el bloque de contexto dinámico del entorno local del usuario.
-    - Qué es: Helper de introspección del sistema operativo y rutas base.
-    - Para qué se usa: Inyectar fecha/hora, SO real (Windows/Linux/Darwin), separador de rutas
-      y directorio de usuario para que Gemini genere rutas nativas válidas sin alucinar sintaxis.
+    Construye el bloque de contexto dinámico del entorno local del usuario y su perfil cognitivo.
+    - Qué es: Helper de introspección del sistema operativo, rutas base y memoria persistente a largo plazo.
+    - Para qué se usa: Inyectar fecha/hora, SO real (Windows/Linux/Darwin), separador de rutas, directorio de
+      usuario y recuerdos acumulados para que Gemini razone con rutas válidas y recuerde datos del usuario.
     """
     now = datetime.now()
     os_name = platform.system()       # Ej: 'Windows', 'Linux', 'Darwin'
@@ -32,14 +45,95 @@ def _build_runtime_context() -> str:
     home_dir = str(Path.home())
     cwd_dir = str(Path.cwd())
 
-    return (
-        f"[Contexto del sistema del usuario]:\n"
-        f"- Fecha y hora actual del equipo: {now.strftime('%d-%m-%Y %H:%M:%S')}.\n"
-        f"- Sistema operativo: {os_name} {os_release} (separador de rutas: '{os.sep}').\n"
-        f"- Directorio raíz del usuario (Home): {home_dir}\n"
-        f"- Directorio actual de trabajo (CWD): {cwd_dir}\n"
-        f"- Regla de rutas: Usa siempre la sintaxis nativa de {os_name} al construir o mostrar rutas."
-    )
+    lines = [
+        "[Contexto del sistema del usuario]:",
+        f"- Fecha y hora actual del equipo: {now.strftime('%d-%m-%Y %H:%M:%S')}.",
+        f"- Sistema operativo: {os_name} {os_release} (separador de rutas: '{os.sep}').",
+        f"- Directorio raíz del usuario (Home): {home_dir}",
+        f"- Directorio actual de trabajo (CWD): {cwd_dir}",
+        f"- Regla de rutas: Usa siempre la sintaxis nativa de {os_name} al construir o mostrar rutas.",
+    ]
+
+    # Inyección de recuerdos a largo plazo y preferencias registradas
+    profile_memory = memory_service.get_profile_context()
+    if profile_memory:
+        lines.append("")
+        lines.append(profile_memory)
+
+    return "\n".join(lines)
+
+
+def _trim_history_to_budget(
+    history: list[dict[str, str]] | None,
+    max_total_chars: int = MAX_HISTORY_TOTAL_CHARS,
+    max_single_chars: int = MAX_SINGLE_HISTORY_MSG_CHARS,
+) -> list[dict[str, str]]:
+    """
+    Poda el historial conversacional desde los mensajes más recientes hacia los más antiguos
+    respetando un presupuesto estricto de caracteres para evitar disparar el consumo de tokens.
+    """
+    if not history:
+        return []
+
+    selected_reversed: list[dict[str, str]] = []
+    accumulated_chars = 0
+
+    for item in reversed(history):
+        raw_content = item.get("content", "")
+        if not raw_content.strip():
+            continue
+
+        # Truncar un mensaje individual si fue demasiado largo (ej. volcado extenso de código)
+        if len(raw_content) > max_single_chars:
+            content = (
+                raw_content[:max_single_chars]
+                + "\n...[contenido histórico truncado por presupuesto de contexto]..."
+            )
+        else:
+            content = raw_content
+
+        if accumulated_chars + len(content) > max_total_chars:
+            # Si ya incluimos al menos un turno reciente y el siguiente desborda el presupuesto, paramos
+            if selected_reversed:
+                break
+            # Si incluso el mensaje más reciente excede el presupuesto global, lo recortamos al límite
+            remaining = max(500, max_total_chars - accumulated_chars)
+            content = content[:remaining] + "\n...[truncado]..."
+
+        selected_reversed.append({
+            "role": item.get("role", "user"),
+            "content": content,
+        })
+        accumulated_chars += len(content)
+
+    selected_reversed.reverse()
+    return selected_reversed
+
+
+async def _execute_tool_safely(call_name: str, call_args: dict[str, Any]) -> dict[str, Any]:
+    """
+    Ejecuta una herramienta en un hilo separado con límite de tiempo estricto (`wait_for`).
+    Evita que unidades de red congeladas o archivos bloqueados por el kernel cuelguen el agente.
+    """
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(execute_tool, call_name, call_args),
+            timeout=TOOL_EXECUTION_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        logger.error(
+            "Timeout ejecutando herramienta '%s' tras %.1fs (args=%s)",
+            call_name,
+            TOOL_EXECUTION_TIMEOUT_SECONDS,
+            call_args,
+        )
+        return {
+            "status": "error",
+            "error": (
+                f"La operación '{call_name}' excedió el tiempo límite de "
+                f"{int(TOOL_EXECUTION_TIMEOUT_SECONDS)} segundos (posible disco lento o recurso bloqueado)."
+            ),
+        }
 
 
 class LLMService:
@@ -79,27 +173,16 @@ class LLMService:
         """
         Genera y transmite la respuesta de Halibel fragmento a fragmento en tiempo real,
         orquestando de forma autónoma la ejecución de herramientas seguras y la supervisión
-        humana (Human-in-the-Loop) para herramientas destructivas.
-        - Qué es: Bucle de razonamiento y ejecución de agente (Agent Loop) con streaming asíncrono.
-        - Para qué se usa:
-            1. Inyectar en el System Instruction la personalidad, fecha/hora y metadatos del SO real.
-            2. Construir la lista de contenidos con el historial previo y las herramientas registradas.
-            3. Detectar llamadas a funciones (`function_calls`) emitidas por Gemini.
-            4. Ejecutar herramientas de solo lectura en hilo separado (`asyncio.to_thread`).
-            5. Pausar y solicitar confirmación interactiva para herramientas destructivas (`safe_delete_file`).
-            6. Reinyectar los resultados en el contexto y continuar el streaming de la respuesta final.
-            7. Acumular y registrar el consumo de tokens en SQLite al finalizar.
-        - Qué conecta: Conecta Gemini API con el catálogo de herramientas (`app.tools.registry`),
-          el WebSocket (`chat.py`) y el monitor de uso (`usage_service`).
+        humana (Human-in-the-Loop) para herramientas destructivas o sensibles.
         """
         if not settings.GEMINI_API_KEY:
             yield (
-                "Hola. Parece que aún no has configurado tu GEMINI_API_KEY en el archivo backend/.env. "
+                f"Hola. Parece que aún no has configurado tu GEMINI_API_KEY en `{settings.ACTIVE_ENV_FILE}`. "
                 "Por favor agrégala para que podamos conversar."
             )
             return
 
-        # Contexto dinámico: personalidad + fecha/hora + arquitectura real del SO
+        # Contexto dinámico: personalidad + fecha/hora + arquitectura real del SO + memoria
         system_instruction = f"{settings.HALIBEL_PERSONA}\n\n{_build_runtime_context()}"
 
         config = types.GenerateContentConfig(
@@ -109,17 +192,17 @@ class LLMService:
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         )
 
-        # Construcción de la conversación con el historial previo
+        # Construcción de la conversación aplicando presupuesto de contexto al historial
+        trimmed_history = _trim_history_to_budget(history)
         contents: list[types.Content] = []
-        if history:
-            for item in history:
-                role = "user" if item.get("role") == "user" else "model"
-                contents.append(
-                    types.Content(
-                        role=role,
-                        parts=[types.Part.from_text(text=item.get("content", ""))],
-                    )
+        for item in trimmed_history:
+            role = "user" if item.get("role") == "user" else "model"
+            contents.append(
+                types.Content(
+                    role=role,
+                    parts=[types.Part.from_text(text=item.get("content", ""))],
                 )
+            )
         contents.append(
             types.Content(
                 role="user",
@@ -154,8 +237,10 @@ class LLMService:
 
                     if chunk.candidates and chunk.candidates[0].content and chunk.candidates[0].content.parts:
                         model_parts.extend(chunk.candidates[0].content.parts)
-
-                    if chunk.text:
+                        for part in chunk.candidates[0].content.parts:
+                            if getattr(part, "text", None):
+                                yield part.text
+                    elif not chunk.function_calls and getattr(chunk, "text", None):
                         yield chunk.text
 
                 # Acumular tokens consumidos en este turno
@@ -177,9 +262,9 @@ class LLMService:
                     call_name = call.name or "unknown_tool"
                     call_args = dict(call.args) if call.args else {}
 
-                    if is_destructive_tool(call_name):
-                        target_path = str(call_args.get("path", "archivo"))
-                        desc = f"Halibel solicita enviar el archivo '{target_path}' a la papelera de reciclaje."
+                    if is_destructive_tool(call_name, call_args):
+                        target_path = str(call_args.get("path", "recurso"))
+                        desc = get_tool_approval_description(call_name, call_args)
                         yield f"\n⚠️ *[Solicitando autorización para: {call_name}]*\n"
 
                         approved = False
@@ -197,18 +282,25 @@ class LLMService:
 
                         if approved:
                             yield f"\n*[Acción autorizada por el usuario. Ejecutando {call_name}...]*\n\n"
-                            # Ejecutamos I/O de disco y papelera en un hilo secundario para no bloquear asyncio
-                            result = await asyncio.to_thread(execute_tool, call_name, call_args)
+                            # Si el usuario aprobó explícitamente un write_file sensible, habilitamos el flag interno
+                            if call_name == "write_file":
+                                call_args["allow_executable"] = True
+                            result = await _execute_tool_safely(call_name, call_args)
                         else:
                             yield "\n*[Acción cancelada o rechazada por el usuario.]*\n\n"
                             result = {
                                 "status": "cancelled",
-                                "message": f"Operación cancelada: El usuario no autorizó eliminar el archivo '{target_path}'.",
+                                "message": f"Operación cancelada: El usuario no autorizó la ejecución de '{call_name}' para '{target_path}'.",
                             }
                     else:
-                        # Herramienta de lectura segura ejecutada sin bloquear el event loop
-                        yield f"\n🔍 *[Consultando: {call_name}...]*\n\n"
-                        result = await asyncio.to_thread(execute_tool, call_name, call_args)
+                        # Herramienta segura ejecutada en segundo plano con timeout preventivo
+                        if "read" in call_name or "list" in call_name or "recall" in call_name:
+                            yield f"\n🔍 *[Consultando: {call_name}...]*\n\n"
+                        elif "memory" in call_name:
+                            yield f"\n🧠 *[Actualizando memoria: {call_name}...]*\n\n"
+                        else:
+                            yield f"\n⚙️ *[Ejecutando: {call_name}...]*\n\n"
+                        result = await _execute_tool_safely(call_name, call_args)
 
                     response_parts.append(
                         types.Part.from_function_response(
