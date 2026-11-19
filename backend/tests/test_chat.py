@@ -91,3 +91,37 @@ def test_chat_history_rest_api():
     assert res_del.json()["cleared"] is True
 
 
+def test_websocket_chat_with_image_data(monkeypatch):
+    """Verifica que el canal WebSocket reciba y procese mensajes multimodales con imagen."""
+    from app.services.llm import llm_service
+
+    # Mock del generador asíncrono de llm_service
+    async def mock_stream(*args, **kwargs):
+        assert kwargs.get("image_data") is not None
+        yield "He analizado la captura de tu pantalla y veo el código correctamente."
+
+    monkeypatch.setattr(llm_service, "stream_message", mock_stream)
+
+    tiny_png_b64 = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+
+    with client.websocket_connect("/api/v1/ws/chat") as websocket:
+        websocket.send_json({
+            "type": "chat",
+            "message": "¿Qué ves en esta pantalla?",
+            "session_id": "test_multimodal",
+            "image_data": tiny_png_b64,
+        })
+
+        # Primer evento debe ser stream_start
+        msg1 = websocket.receive_json()
+        assert msg1["type"] == "stream_start"
+
+        # Segundo evento es el chunk de respuesta
+        msg2 = websocket.receive_json()
+        assert msg2["type"] == "chunk"
+        assert "captura de tu pantalla" in msg2["content"]
+
+        # Tercer evento es stream_end
+        msg3 = websocket.receive_json()
+        assert msg3["type"] == "stream_end"
+

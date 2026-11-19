@@ -16,4 +16,6 @@ contextBridge.exposeInMainWorld('halibelAPI', {
   resize: (width: number, height: number) => ipcRenderer.invoke('window:resize', width, height),
   // Obtiene el token efímero generado por Electron para autenticación con el runtime FastAPI
   getIpcToken: () => ipcRenderer.invoke('auth:get-token'),
+  // Captura la pantalla del usuario en base64 para percepción multimodal de Halibel
+  captureScreen: () => ipcRenderer.invoke('screen:capture'),
 })

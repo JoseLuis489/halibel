@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, screen, Tray, Menu, nativeImage } from 'electron'
+import { app, BrowserWindow, ipcMain, screen, Tray, Menu, nativeImage, desktopCapturer } from 'electron'
 import path from 'node:path'
 import { spawn, execSync, ChildProcess } from 'node:child_process'
 import fs from 'node:fs'
@@ -333,6 +333,25 @@ ipcMain.handle('window:resize', (_event, width: number, height: number) => {
 // Retorna el secreto efímero generado para autenticación del WebSocket e IPC local
 ipcMain.handle('auth:get-token', () => {
   return IPC_SECRET
+})
+
+// Captura la pantalla primaria en resolución optimizada (1280x720 JPEG) para percepción visual del agente
+ipcMain.handle('screen:capture', async () => {
+  try {
+    const sources = await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: { width: 1280, height: 720 },
+    })
+    if (sources && sources.length > 0) {
+      const primarySource = sources[0]
+      const jpegBuffer = primarySource.thumbnail.toJPEG(80)
+      return `data:image/jpeg;base64,${jpegBuffer.toString('base64')}`
+    }
+    return null
+  } catch (err) {
+    console.error('Error al capturar pantalla con desktopCapturer:', err)
+    return null
+  }
 })
 
 // =====================================================================

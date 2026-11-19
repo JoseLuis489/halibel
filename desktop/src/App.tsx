@@ -11,6 +11,7 @@ import {
   ArrowDown,
   RotateCcw,
   Brain,
+  Camera,
 } from 'lucide-react'
 
 // Estructura de solicitud de autorización de herramientas (Human-in-the-Loop)
@@ -26,6 +27,7 @@ interface ToolApprovalRequest {
 interface Message {
   role: 'user' | 'halibel'
   content: string
+  image?: string
   approval?: ToolApprovalRequest
 }
 
@@ -43,6 +45,7 @@ declare global {
       close: () => Promise<void>
       resize: (width: number, height: number) => Promise<void>
       getIpcToken: () => Promise<string>
+      captureScreen: () => Promise<string | null>
     }
   }
 }
@@ -158,6 +161,8 @@ export default function App() {
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('connecting')
   const [showScrollBottom, setShowScrollBottom] = useState(false)
   const [memoryToast, setMemoryToast] = useState<string | null>(null)
+  const [attachedImage, setAttachedImage] = useState<string | null>(null)
+  const [isCapturing, setIsCapturing] = useState<boolean>(false)
 
   const socketRef = useRef<WebSocket | null>(null)
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -459,18 +464,41 @@ export default function App() {
   }
 
   /**
+   * Captura la pantalla actual mediante Electron para que Halibel la analice visualmente.
+   */
+  const handleCaptureScreen = async () => {
+    if (!window.halibelAPI?.captureScreen || isCapturing) return
+    setIsCapturing(true)
+    try {
+      const dataUrl = await window.halibelAPI.captureScreen()
+      if (dataUrl) {
+        setAttachedImage(dataUrl)
+      }
+    } catch (err) {
+      console.error('Error al capturar pantalla:', err)
+    } finally {
+      setIsCapturing(false)
+    }
+  }
+
+  /**
    * Envía el mensaje del usuario al modelo de IA a través del WebSocket.
    */
   const sendMessage = () => {
-    if (!input.trim() || state !== 'idle') return
+    if ((!input.trim() && !attachedImage) || state !== 'idle') return
 
-    const userText = input.trim()
+    const userText = input.trim() || 'Por favor revisa la captura de pantalla adjunta.'
+    const currentAttached = attachedImage
     isUserNearBottomRef.current = true
     setShowScrollBottom(false)
 
-    const newMessages = [...messages, { role: 'user' as const, content: userText }]
+    const newMessages: Message[] = [
+      ...messages,
+      { role: 'user' as const, content: userText, image: currentAttached || undefined },
+    ]
     setMessages(newMessages)
     setInput('')
+    setAttachedImage(null)
     setState('thinking')
 
     if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
@@ -487,6 +515,7 @@ export default function App() {
           type: 'chat',
           message: userText,
           history: validHistory,
+          image_data: currentAttached,
         })
       )
     } else {
@@ -634,6 +663,21 @@ export default function App() {
                     )}
                   </div>
                 )}
+                {msg.image && (
+                  <div style={{ marginBottom: '6px' }}>
+                    <img
+                      src={msg.image}
+                      alt="Captura de pantalla adjunta"
+                      style={{
+                        maxWidth: '100%',
+                        maxHeight: '160px',
+                        borderRadius: '6px',
+                        border: '1px solid rgba(255, 255, 255, 0.2)',
+                        display: 'block',
+                      }}
+                    />
+                  </div>
+                )}
                 {msg.content && <FormattedMessage content={msg.content} />}
               </div>
             ))}
@@ -666,8 +710,64 @@ export default function App() {
             </button>
           )}
 
+          {/* Banner de previsualización cuando se ha capturado la pantalla */}
+          {attachedImage && (
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                padding: '5px 10px',
+                margin: '0 12px 6px',
+                borderRadius: '8px',
+                background: 'rgba(30, 41, 59, 0.85)',
+                border: '1px solid rgba(56, 189, 248, 0.4)',
+                boxShadow: '0 2px 8px rgba(0, 0, 0, 0.3)',
+                backdropFilter: 'blur(8px)',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <img
+                  src={attachedImage}
+                  alt="Captura previa"
+                  style={{
+                    width: '38px',
+                    height: '22px',
+                    objectFit: 'cover',
+                    borderRadius: '4px',
+                    border: '1px solid rgba(255, 255, 255, 0.2)',
+                  }}
+                />
+                <span style={{ fontSize: '11px', color: '#38bdf8' }}>
+                  Pantalla capturada (lista para enviar)
+                </span>
+              </div>
+              <button
+                className="btn-icon"
+                onClick={() => setAttachedImage(null)}
+                title="Descartar captura"
+                style={{ width: '20px', height: '20px' }}
+              >
+                <X size={12} />
+              </button>
+            </div>
+          )}
+
           {/* Campo de entrada de texto y botón de envío / cancelación */}
           <div className="chat-input-area">
+            <button
+              className="btn-icon"
+              onClick={handleCaptureScreen}
+              disabled={state !== 'idle' || isDisconnected || isCapturing}
+              title={isCapturing ? 'Capturando pantalla...' : 'Capturar pantalla para Halibel'}
+              style={{
+                marginRight: '2px',
+                color: attachedImage ? '#38bdf8' : '#94a3b8',
+                background: attachedImage ? 'rgba(56, 189, 248, 0.15)' : 'transparent',
+              }}
+            >
+              <Camera size={15} />
+            </button>
             <input
               type="text"
               className="chat-input"
