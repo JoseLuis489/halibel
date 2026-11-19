@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import logging
 import os
 import platform
@@ -52,6 +53,7 @@ def _build_runtime_context() -> str:
         f"- Directorio raíz del usuario (Home): {home_dir}",
         f"- Directorio actual de trabajo (CWD): {cwd_dir}",
         f"- Regla de rutas: Usa siempre la sintaxis nativa de {os_name} al construir o mostrar rutas.",
+        "- Percepción y herramientas: Cuentas con herramientas de búsqueda web (web_search) y lectura de páginas (fetch_web_page), además de visión multimodal si el usuario envía capturas de pantalla.",
     ]
 
     # Inyección de recuerdos a largo plazo y preferencias registradas
@@ -169,6 +171,7 @@ class LLMService:
         user_message: str,
         history: list[dict[str, str]] | None = None,
         on_approval_request: Callable[[str, str, dict[str, Any], str], Awaitable[bool]] | None = None,
+        image_data: str | None = None,
     ) -> AsyncGenerator[str, None]:
         """
         Genera y transmite la respuesta de Halibel fragmento a fragmento en tiempo real,
@@ -203,10 +206,21 @@ class LLMService:
                     parts=[types.Part.from_text(text=item.get("content", ""))],
                 )
             )
+        user_parts = [types.Part.from_text(text=user_message)]
+        if image_data and image_data.startswith("data:image/"):
+            try:
+                header, encoded = image_data.split(",", 1)
+                mime_type = header.split(";")[0].replace("data:", "")
+                image_bytes = base64.b64decode(encoded)
+                user_parts.append(types.Part.from_bytes(data=image_bytes, mime_type=mime_type))
+                logger.info("Imagen multimodal procesada correctamente (%s, %d bytes)", mime_type, len(image_bytes))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("No se pudo decodificar la imagen adjunta: %s", e)
+
         contents.append(
             types.Content(
                 role="user",
-                parts=[types.Part.from_text(text=user_message)],
+                parts=user_parts,
             )
         )
 
@@ -294,7 +308,11 @@ class LLMService:
                             }
                     else:
                         # Herramienta segura ejecutada en segundo plano con timeout preventivo
-                        if "read" in call_name or "list" in call_name or "recall" in call_name:
+                        if "web_search" in call_name or "search" in call_name:
+                            yield f"\n🌐 *[Buscando en internet: {call_name}...]*\n\n"
+                        elif "fetch" in call_name or "page" in call_name:
+                            yield f"\n📄 *[Leyendo página web: {call_name}...]*\n\n"
+                        elif "read" in call_name or "list" in call_name or "recall" in call_name:
                             yield f"\n🔍 *[Consultando: {call_name}...]*\n\n"
                         elif "memory" in call_name:
                             yield f"\n🧠 *[Actualizando memoria: {call_name}...]*\n\n"

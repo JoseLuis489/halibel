@@ -10,6 +10,7 @@ from app.tools.filesystem import (
     write_file,
 )
 from app.tools.memory import forget_user_memory, recall_memories, save_user_memory
+from app.tools.web import fetch_web_page, web_search
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,8 @@ AVAILABLE_TOOLS: list[Callable[..., Any]] = [
     save_user_memory,
     recall_memories,
     forget_user_memory,
+    web_search,
+    fetch_web_page,
 ]
 
 # Mapa de despacho por nombre de función para ejecución controlada
@@ -33,10 +36,12 @@ TOOL_DISPATCH: dict[str, Callable[..., Any]] = {
     "save_user_memory": save_user_memory,
     "recall_memories": recall_memories,
     "forget_user_memory": forget_user_memory,
+    "web_search": web_search,
+    "fetch_web_page": fetch_web_page,
 }
 
 # Políticas de clasificación base
-READ_ONLY_TOOLS = {"list_directory", "read_file", "recall_memories"}
+READ_ONLY_TOOLS = {"list_directory", "read_file", "recall_memories", "web_search", "fetch_web_page"}
 ALWAYS_DESTRUCTIVE_TOOLS = {"safe_delete_file"}
 
 

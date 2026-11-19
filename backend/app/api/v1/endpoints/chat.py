@@ -72,6 +72,8 @@ def _clean_response_for_memory(raw_text: str) -> str:
     status_prefixes = (
         "🔍 *[Consultando:",
         "🧠 *[Actualizando memoria:",
+        "🌐 *[Buscando en internet:",
+        "📄 *[Leyendo página web:",
         "⚙️ *[Ejecutando:",
         "⚠️ *[Solicitando autorización",
         "*[Acción autorizada",
@@ -122,6 +124,8 @@ class WSIncomingMessage(BaseModel):
     # Campos para autorización interactiva (Human-in-the-Loop):
     tool_call_id: str | None = None
     approved: bool | None = None
+    # Campo multimodal para percepción visual (captura de pantalla o imagen):
+    image_data: str | None = None
 
 
 # =====================================================================
@@ -233,6 +237,7 @@ async def websocket_chat(websocket: WebSocket):
         user_msg: str,
         history_data: list[dict[str, str]],
         session_id: str = "default_session",
+        image_data: str | None = None,
     ) -> None:
         """Corrutina aislada que consume el generador de Gemini, envía chunks y persiste el diálogo."""
         if not await _safe_send_json(websocket, {"type": "stream_start"}):
@@ -244,6 +249,7 @@ async def websocket_chat(websocket: WebSocket):
                 user_msg,
                 history=history_data,
                 on_approval_request=on_approval_request,
+                image_data=image_data,
             ):
                 accumulated_chunks.append(chunk)
                 sent = await _safe_send_json(websocket, {"type": "chunk", "content": chunk})
@@ -342,7 +348,12 @@ async def websocket_chat(websocket: WebSocket):
 
                 history_dicts = [{"role": m.role, "content": m.content} for m in payload.history]
                 active_stream_task = asyncio.create_task(
-                    run_llm_stream(payload.message, history_dicts, payload.session_id)
+                    run_llm_stream(
+                        payload.message,
+                        history_dicts,
+                        payload.session_id,
+                        payload.image_data,
+                    )
                 )
 
     except WebSocketDisconnect:
